@@ -740,8 +740,8 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
         self.assertEqual(cleaned["state"], "cleaned")
 
-    def test_queued_wrapper_identity_allows_brief_startup_grace(self):
-        check = RUNNER_API["queued_wrapper_identity_matches"]
+    def test_wrapper_identity_allows_brief_process_table_grace(self):
+        check = RUNNER_API["wrapper_identity_matches_with_grace"]
         identity = mock.Mock(side_effect=(False, False, True))
         with mock.patch.dict(
             check.__globals__,
@@ -752,6 +752,18 @@ class AgentWorkerTests(unittest.TestCase):
         ):
             self.assertTrue(check("queued-worker", 12345))
         self.assertEqual(identity.call_count, 3)
+
+    def test_cancel_finishes_cleanly_when_wrapper_exits_during_identity_check(self):
+        self.seed_worker("wrapper-exited-during-cancel", agent="codex", state="running")
+        args = argparse.Namespace(worker_id="wrapper-exited-during-cancel", timeout=1)
+
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_CLI_WORKERS_STATE_DIR": str(self.state_dir)},
+        ):
+            metadata = RUNNER_API["finish_cancel_after_wrapper_exit"](args)
+
+        self.assertEqual(metadata["state"], "cancelled")
 
     def test_cancel_terminates_agent_descendants(self):
         child_pid_path = self.root / "descendant.pid"

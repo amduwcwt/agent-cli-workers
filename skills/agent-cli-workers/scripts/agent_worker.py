@@ -756,7 +756,7 @@ def wrapper_identity_matches(worker_id: str, pid: int) -> bool:
     )
 
 
-def queued_wrapper_identity_matches(worker_id: str, pid: int) -> bool:
+def wrapper_identity_matches_with_grace(worker_id: str, pid: int) -> bool:
     if wrapper_identity_matches(worker_id, pid):
         return True
     deadline = time.monotonic() + 0.5
@@ -818,10 +818,7 @@ def refreshed_metadata(worker_id: str) -> dict:
             return metadata
         wrapper_pid = metadata.get("wrapper_pid")
         wrapper_alive = is_pid_alive(wrapper_pid)
-        if wrapper_alive and metadata.get("state") == "queued":
-            wrapper_matches = queued_wrapper_identity_matches(worker_id, wrapper_pid)
-        else:
-            wrapper_matches = wrapper_alive and wrapper_identity_matches(worker_id, wrapper_pid)
+        wrapper_matches = wrapper_alive and wrapper_identity_matches_with_grace(worker_id, wrapper_pid)
         if wrapper_matches:
             return metadata
         identity_mismatch = wrapper_alive and not wrapper_matches
@@ -1096,6 +1093,15 @@ def stop_orphan(args: argparse.Namespace, metadata: dict) -> dict:
     )
 
 
+def finish_cancel_after_wrapper_exit(args: argparse.Namespace) -> dict:
+    metadata = load_metadata(args.worker_id)
+    if metadata.get("state") in TERMINAL_STATES:
+        return metadata
+    if agent_identity_matches(metadata):
+        return stop_orphan(args, metadata)
+    return update_metadata(args.worker_id, state="cancelled", finished_at=utc_now())
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     metadata = refreshed_metadata(args.worker_id)
     if metadata.get("wrapper_identity_mismatch") and metadata.get("state") == "lost":
@@ -1121,14 +1127,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     pid = metadata.get("wrapper_pid")
     if not is_pid_alive(pid):
-        metadata = refreshed_metadata(args.worker_id)
-        if metadata.get("state") == "orphaned":
-            metadata = stop_orphan(args, metadata)
-        elif metadata.get("state") not in TERMINAL_STATES:
-            metadata = update_metadata(args.worker_id, state="cancelled", finished_at=utc_now())
-        emit(public_metadata(metadata))
+        emit(public_metadata(finish_cancel_after_wrapper_exit(args)))
         return 0
     if not wrapper_identity_matches(args.worker_id, pid):
+        if not is_pid_alive(pid):
+            emit(public_metadata(finish_cancel_after_wrapper_exit(args)))
+            return 0
         raise RunnerError(
             "process_identity_mismatch",
             "refusing to signal a PID that is not this worker's detached wrapper",
@@ -1146,20 +1150,18 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             break
         time.sleep(0.05)
 
-    if is_pid_alive(pid):
-        if not wrapper_identity_matches(args.worker_id, pid):
-            raise RunnerError("process_identity_mismatch", "wrapper identity changed before forced cancellation", 5)
+    wrapper_alive = is_pid_alive(pid)
+    wrapper_matches = wrapper_alive and wrapper_identity_matches(args.worker_id, pid)
+    if wrapper_alive and not wrapper_matches and is_pid_alive(pid):
+        raise RunnerError("process_identity_mismatch", "wrapper identity changed before forced cancellation", 5)
+    if wrapper_matches:
         try:
             os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        latest = load_metadata(args.worker_id)
-        if agent_identity_matches(latest):
-            signal_agent(latest, signal.SIGKILL)
-    else:
-        latest = load_metadata(args.worker_id)
-        if agent_identity_matches(latest):
-            signal_agent(latest, signal.SIGKILL)
+    latest = load_metadata(args.worker_id)
+    if agent_identity_matches(latest):
+        signal_agent(latest, signal.SIGKILL)
     metadata = update_metadata(
         args.worker_id,
         state="cancelled",
