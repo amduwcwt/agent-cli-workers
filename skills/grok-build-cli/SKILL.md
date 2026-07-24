@@ -64,7 +64,7 @@ The shared runner defaults Grok to `--sandbox read-only`. For an editing task, r
 
 Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations. Use it only for a short, closed check that should finish in a few tool turns; never use `1`, because a reasoning event can consume the only turn.
 
-For long work, split the task into bounded deliverables and set a concrete wall-clock deadline before spawning. The caller owns that deadline by polling `status` and cancelling when needed, and should state a token or cost budget when the provider supports one. Do not start uncapped long work when the caller cannot monitor and cancel it. If Grok reports `max turns reached` or another non-completion stop reason, collect diagnostics once and do not `followup` that native session merely to ask it to finish. Start fresh only after narrowing the task or deliberately removing the cap.
+For long work, split the task into bounded deliverables and add `--deadline-seconds <positive-seconds>` when the runner should enforce a wall-clock deadline. It starts the clock when the Grok child starts, sends `SIGTERM` to the agent process group at expiry, waits three seconds, and escalates to `SIGKILL` if needed. A deadline is opt-in, per worker, and never inherited by `followup`. A timed-out worker is failed and cannot be resumed; narrow the task and start fresh. Provider-aware token or cost budgets are not yet enforced. If Grok reports `max turns reached` or another non-completion stop reason, collect diagnostics once and do not `followup` that native session merely to ask it to finish. Start fresh only after narrowing the task or deliberately removing the cap.
 
 ### Observe and collect
 
@@ -87,7 +87,7 @@ python3 "$RUNNER" cancel <worker-id>
 python3 "$RUNNER" cleanup <worker-id>
 ```
 
-`followup` creates a new worker record and resumes the parent's native Grok `sessionId`. Grok requires the exact sandbox profile used to create that session. A `danger-full-access` parent therefore requires the flag again on every follow-up; use a fresh session to change profiles. Legacy sessions without a recorded sandbox profile are not resumed by the safe runner. `bypassPermissions` is never inherited. `cancel` verifies process identity and terminates the owned process group. A surviving Grok child whose wrapper died becomes `orphaned`; cleanup remains blocked until it is safely cancelled or otherwise terminal.
+`followup` creates a new worker record and resumes the parent's native Grok `sessionId`. Grok requires the exact sandbox profile used to create that session. A `danger-full-access` parent therefore requires the flag again on every follow-up; use a fresh session to change profiles. Legacy sessions without a recorded sandbox profile and deadline-exceeded sessions are not resumed by the safe runner. `bypassPermissions` and deadlines are never inherited. `cancel` verifies process identity and terminates the owned process group. A surviving Grok child whose wrapper died becomes `orphaned`; cleanup remains blocked until it is safely cancelled or otherwise terminal.
 
 Only one active worker may resume the same native session. Wait for or cancel it before starting another follow-up.
 
@@ -105,7 +105,7 @@ python3 "$LEGACY_RUNNER" spawn \
   --prompt-file <absolute-task-file>
 ```
 
-It injects `--agent grok`, filters legacy `list` output to Grok, maps `--grok-binary` to `--binary`, and gives an explicit `GROK_BUILD_CLI_STATE_DIR` precedence when mapping it to `AGENT_CLI_WORKERS_STATE_DIR`. Keep it for existing scripts; use the shared runner for new workflows.
+It injects `--agent grok`, filters legacy `list` output to Grok, maps `--grok-binary` to `--binary`, forwards `--deadline-seconds`, and gives an explicit `GROK_BUILD_CLI_STATE_DIR` precedence when mapping it to `AGENT_CLI_WORKERS_STATE_DIR`. Keep it for existing scripts; use the shared runner for new workflows.
 
 ## Run a direct task
 
@@ -157,6 +157,7 @@ Direct and async calls intentionally use the user's normal Grok configuration, i
 
 - collect Grok's final capsule and exit status with `--capsule`;
 - verify changed files and focused tests from Codex;
+- retain and inspect a timed-out write worker's worktree because process termination does not roll back partial edits;
 - report worker ID, native session ID, and worktree when relevant;
 - cancel abandoned workers;
 - clean terminal worker state and temporary worktrees deliberately.

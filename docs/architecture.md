@@ -2,7 +2,7 @@
 
 ## Boundary
 
-`agent_worker.py` is a local lifecycle adapter, not an orchestrator control plane. Every public command emits one JSON object. The controlling agent or human owns task decomposition, worktree creation, result review, verification, integration, wall-clock deadlines, and token or cost budgets. The runner does not add a turn cap unless the caller explicitly requests one.
+`agent_worker.py` is a local lifecycle adapter, not an orchestrator control plane. Every public command emits one JSON object. The controlling agent or human owns task decomposition, worktree creation, result review, verification, integration, and token or cost budgets. The runner can enforce an opt-in per-worker wall-clock deadline but does not add a turn cap unless the caller explicitly requests one.
 
 ## Lifecycle
 
@@ -13,6 +13,8 @@ spawn -> queued -> running -> succeeded|failed|cancelled|lost
 ```
 
 The detached wrapper owns an agent process group. Metadata records wrapper and child identities so cancellation does not signal a reused unrelated PID. If a wrapper disappears while its child remains identifiable, the record becomes `orphaned` and can still be cancelled safely.
+
+An optional `--deadline-seconds` starts when the provider child starts. At expiry the wrapper records deadline metadata, sends `SIGTERM` to the agent process group, waits three seconds, and escalates to `SIGKILL`. The wrapper remains alive to clean the prompt, parse residual output, and commit terminal metadata. The result is `failed` with `termination_reason=deadline_exceeded`; it cannot be resumed, and follow-ups do not inherit the parent's deadline. This is process-group cancellation, not rollback: partial workspace writes remain, and descendants that deliberately leave the process group are outside the cancellation boundary.
 
 Native continuation is adapter-specific:
 

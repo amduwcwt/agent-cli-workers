@@ -22,6 +22,7 @@ RUNNER = (
 VALUE_OPTIONS = {
     "--binary",
     "--cwd",
+    "--deadline-seconds",
     "--grok-binary",
     "--max-bytes",
     "--max-turns",

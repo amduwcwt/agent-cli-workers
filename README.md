@@ -22,7 +22,7 @@ The runner provides:
 - Grok and Codex adapters without a daemon, database, tmux, or service account;
 - native Grok session and Codex thread resume;
 - read-only sandbox defaults and explicit per-worker escalation;
-- private prompt files, process-group cancellation, and owned state directories;
+- private prompt files, process-group cancellation/deadlines, and owned state directories;
 - allowlisted Grok results that never emit the provider `thought` field;
 - `collect --capsule`, which normalizes the final six-line handoff and rejects invalid or oversized successful results;
 - workflow guidance for one writer per overlapping file set and caller-owned worktrees.
@@ -102,7 +102,9 @@ For an editing worker, choose `--agent codex --sandbox workspace-write`. Create 
 
 The runner does not set a turn cap by default. Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations; evidence gathering can exhaust the cap before the worker produces a completion capsule. Use the option only for a short, closed Grok check that should finish in a few tool turns.
 
-Split long work into bounded deliverables and set a concrete wall-clock deadline before spawning. The caller owns that deadline through `status` and `cancel`, and should set a token or cost budget in the task or provider when available. Do not start uncapped long work when it cannot be monitored and cancelled. The runner does not currently enforce either budget automatically. After a `max turns reached` failure, collect diagnostics once and do not resume the same native session merely to ask for the missing conclusion.
+Split long work into bounded deliverables. Add `--deadline-seconds <positive-seconds>` to `spawn` when the runner should enforce a per-worker wall-clock deadline. The clock starts when the provider child starts. At expiry the wrapper sends `SIGTERM` to the agent process group, waits three seconds, and escalates to `SIGKILL` if necessary. The worker finishes as `failed` with `termination_reason=deadline_exceeded`; that native session cannot be resumed. Deadlines are opt-in and never inherited by `followup`. The runner does not yet enforce provider-aware token or cost budgets. After a `max turns reached` failure, collect diagnostics once and do not resume the same native session merely to ask for the missing conclusion.
+
+Deadline termination is not a rollback. A write-capable worker can leave a partial diff, so retain and inspect its worktree before deciding whether to integrate or discard it. Process-group cancellation covers descendants that remain in the agent's group; a descendant that deliberately creates a new session/process group is outside that guarantee.
 
 ## Model policy
 

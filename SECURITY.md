@@ -10,6 +10,7 @@ After the GitHub repository is published, report suspected vulnerabilities throu
 - Raw stdout/stderr captures remain in the private worker directory until cleanup. `collect --capsule` minimizes what enters the controlling context but does not erase local captures.
 - Ordinary `collect` is for terminal failure diagnosis and may return allowlisted final text plus stderr. Treat both as potentially sensitive.
 - The runner validates process identity before cancellation, but lifecycle support assumes Unix process groups and `ps` behavior.
+- Deadline and cancellation signals cover the agent-owned process group, not descendants that deliberately create another session/process group. They also do not roll back filesystem writes; inspect partial diffs from a terminated write worker before integration or cleanup.
 - The caller owns worktree creation, integration, and deletion. Never infer that a worker in another worktree covers the current repository.
 
 ## Required review for changes

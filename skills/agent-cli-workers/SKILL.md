@@ -49,7 +49,8 @@ Use both adapters only when tasks are independent or in a deliberate writer-revi
 
 - Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations. These tasks can consume the cap during evidence gathering before producing a completion capsule.
 - Use `--max-turns` only for a short, closed check that should finish in a few tool turns. Treat it as an explicit per-task limit, never a default safety setting.
-- Before starting a long task, split it into bounded deliverables and set a concrete wall-clock deadline. The caller owns that deadline by polling `status` and cancelling when it is reached; state a token or cost budget in the task or provider configuration when one is available. Do not start uncapped long work when the caller cannot monitor and cancel it. The runner does not currently enforce a wall-clock or token budget automatically.
+- Before starting a long task, split it into bounded deliverables. Use `--deadline-seconds <positive-seconds>` when the runner should enforce a per-worker wall-clock deadline. The clock starts when the provider child starts, and the wrapper terminates the agent process group with `SIGTERM`, waits three seconds, then uses `SIGKILL` if needed.
+- A deadline is opt-in and never inherited by `followup`. A deadline-exceeded worker is terminal (`state=failed`, `termination_reason=deadline_exceeded`) and cannot be resumed; narrow the work and start a fresh worker. The runner does not currently enforce provider-aware token or cost budgets.
 - If a worker fails with `max turns reached` or a corresponding non-completion stop reason, collect diagnostics once and do not `followup` that native session merely to request the missing conclusion. Start a fresh worker only after narrowing the task or deliberately removing the cap.
 
 ## Isolation policy
@@ -104,6 +105,7 @@ python3 "$RUNNER" spawn \
   --agent grok \
   --cwd "$WORKDIR" \
   --sandbox read-only \
+  --deadline-seconds 900 \
   --prompt-file "$PROMPT"
 
 # Codex (uses the CLI's configured model by default)
@@ -120,6 +122,7 @@ python3 "$RUNNER" spawn \
 |---|---|---|
 | `--permission-mode` | ✅ | ⚠️ unsupported |
 | `--max-turns` | ✅ short checks only; omit for research/source scans | ⚠️ unsupported |
+| `--deadline-seconds` | ✅ per worker | ✅ per worker |
 | `--sandbox` | pass-through | ✅ |
 | `--dangerously-bypass-approvals-and-sandbox` | ⚠️ unsupported | ✅ |
 | `--model` | pass-through except disabled models | pass-through except disabled models |
@@ -178,7 +181,7 @@ python3 "$RUNNER" cleanup <worker-id>
 - `3` still running (when `--wait` times out)
 - `4` successful worker returned an invalid completion capsule in `--capsule` mode
 
-`followup` only works for terminal workers with captured native session/thread id.
+`followup` only works for terminal workers with captured native session/thread id. A deadline-exceeded worker cannot be resumed, and a new follow-up inherits no deadline unless `--deadline-seconds` is supplied again.
 
 `followup` inherits ordinary adapter settings. Codex bypass and `danger-full-access` are de-escalated unless explicitly requested again. Grok requires the exact sandbox profile used to create its native session: `danger-full-access` must be explicitly repeated, a different profile requires a fresh session, and legacy sessions with no recorded profile are not resumed. Grok `bypassPermissions` is never inherited.
 
@@ -205,7 +208,8 @@ Use the exact repository or worktree path with `list --cwd` before deciding whet
 - Use `--prompt-file` or `--prompt-stdin` for secret-bearing tasks. The compatibility-only `--prompt` form exposes text in the caller's argv.
 - Prompt sources are limited to 1 MiB. `collect --max-bytes` also bounds structured-result parsing. Truncated Grok JSON is never echoed as raw stdout.
 - Normalized completion capsules are limited to 16 KiB; an oversized handoff is invalid.
-- Cancellation owns the full agent process group and does not mark the worker terminal until spawned descendants have been terminated.
+- Cancellation and deadline enforcement target the agent-owned process group and do not intentionally kill the wrapper, allowing it to clean the private prompt and persist final metadata. Descendants that deliberately create a new session/process group are outside this guarantee.
+- A deadline is process cancellation, not a transaction or rollback. A write-capable worker may leave a partial diff; retain and inspect its worktree before integrating, discarding, or cleaning state.
 - Status detects a reused/mismatched wrapper PID, marks the record `lost`, and refuses to signal the unrelated process.
 - Result parsing is memory-bounded, but the worker capture files do not have an execution-time disk quota. Inspect unexpectedly large state directories before collection and clean terminal workers deliberately.
 - Keep unrelated editing tasks out of the same files across multiple active workers.

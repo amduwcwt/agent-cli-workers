@@ -533,6 +533,21 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertEqual(cancel_proc.returncode, 2)
         self.assertEqual(cancel["error"], "invalid_timeout")
 
+    def test_invalid_deadline_is_rejected_before_worker_creation(self):
+        prompt = self.write_prompt("invalid-deadline.md", "deadline validation")
+
+        for value in ("0", "-1", "nan", "inf"):
+            proc, payload = self.spawn(
+                "grok",
+                prompt,
+                "--deadline-seconds",
+                value,
+            )
+            self.assertEqual(proc.returncode, 2, (value, proc.stderr))
+            self.assertEqual(payload["error"], "invalid_deadline")
+
+        self.assertEqual(list(self.state_dir.glob("*/metadata.json")), [])
+
     def test_codex_adapter_uses_cli_model_default_and_collects_jsonl(self):
         secret = "codex-secret-marker"
         prompt = self.write_prompt("codex.md", f"SLEEP=2\n{secret}")
@@ -750,6 +765,131 @@ class AgentWorkerTests(unittest.TestCase):
         cleanup_proc, cleaned = self.run_cli("cleanup", worker_id)
         self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
         self.assertEqual(cleaned["state"], "cleaned")
+
+    def test_deadline_terminates_agent_group_and_blocks_followup(self):
+        child_pid_path = self.root / "deadline-child.pid"
+        prompt = self.write_prompt(
+            "deadline.md",
+            f"SPAWN_CHILD_PID={child_pid_path}\nSLEEP=30\ndeadline task",
+        )
+        proc, spawned = self.spawn(
+            "grok",
+            prompt,
+            "--deadline-seconds",
+            "0.25",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(spawned["deadline_seconds"], 0.25)
+
+        finished = self.wait_state(spawned["worker_id"], {"failed"}, timeout=6)
+        self.assertEqual(finished["termination_reason"], "deadline_exceeded")
+        self.assertEqual(finished["deadline_seconds"], 0.25)
+        self.assertIn("deadline_at", finished)
+        self.assertIn("timed_out_at", finished)
+        self.assertIn("deadline exceeded", finished["runner_error"])
+        self.assertFalse((self.state_dir / spawned["worker_id"] / "prompt.md").exists())
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not child_pid_path.exists():
+            time.sleep(0.02)
+        self.assertTrue(child_pid_path.exists())
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and self.process_is_alive(child_pid):
+            time.sleep(0.05)
+        self.assertFalse(self.process_is_alive(child_pid))
+
+        collect_proc, collected = self.run_cli("collect", spawned["worker_id"])
+        self.assertEqual(collect_proc.returncode, 1, collect_proc.stderr)
+        self.assertEqual(collected["termination_reason"], "deadline_exceeded")
+
+        follow_prompt = self.write_prompt("deadline-follow.md", "do not resume")
+        follow_proc, follow = self.run_cli(
+            "followup",
+            spawned["worker_id"],
+            "--prompt-file",
+            str(follow_prompt),
+        )
+        self.assertEqual(follow_proc.returncode, 4)
+        self.assertEqual(follow["error"], "deadline_session_not_resumable")
+
+    def test_deadline_allows_fast_worker_and_is_not_inherited(self):
+        prompt = self.write_prompt("deadline-fast.md", "fast deadline task")
+        proc, first = self.spawn(
+            "grok",
+            prompt,
+            "--deadline-seconds",
+            "2",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        finished = self.wait_state(first["worker_id"], {"succeeded"})
+        self.assertEqual(finished["deadline_seconds"], 2.0)
+        self.assertIn("deadline_at", finished)
+        self.assertNotIn("termination_reason", finished)
+
+        follow_prompt = self.write_prompt("deadline-fast-follow.md", "fast follow-up")
+        follow_proc, follow = self.run_cli(
+            "followup",
+            first["worker_id"],
+            "--prompt-file",
+            str(follow_prompt),
+        )
+        self.assertEqual(follow_proc.returncode, 0, follow_proc.stderr)
+        self.assertNotIn("deadline_seconds", follow)
+        self.assertEqual(
+            self.wait_state(follow["worker_id"], {"succeeded"})["state"],
+            "succeeded",
+        )
+
+    def test_deadline_applies_to_codex_adapter(self):
+        prompt = self.write_prompt("deadline-codex.md", "SLEEP=30\ncodex deadline")
+        proc, spawned = self.spawn(
+            "codex",
+            prompt,
+            "--deadline-seconds",
+            "0.2",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        finished = self.wait_state(spawned["worker_id"], {"failed"}, timeout=6)
+        self.assertEqual(finished["termination_reason"], "deadline_exceeded")
+        self.assertEqual(finished["deadline_seconds"], 0.2)
+        self.assertFalse((self.state_dir / spawned["worker_id"] / "prompt.md").exists())
+
+        collect_proc, collected = self.run_cli("collect", spawned["worker_id"])
+        self.assertEqual(collect_proc.returncode, 1, collect_proc.stderr)
+        self.assertEqual(collected["termination_reason"], "deadline_exceeded")
+
+    def test_process_group_stop_escalates_after_grace(self):
+        ready_path = self.root / "sigterm-ignored.ready"
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,signal,time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    f"pathlib.Path({str(ready_path)!r}).touch(); "
+                    "time.sleep(30)"
+                ),
+            ],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not ready_path.exists():
+            time.sleep(0.01)
+        self.assertTrue(ready_path.exists())
+
+        stopped = RUNNER_API["stop_process_group"](
+            child.pid,
+            grace_seconds=0.1,
+            leader=child,
+        )
+
+        self.assertTrue(stopped)
+        child.wait(timeout=2)
+        self.assertEqual(child.returncode, -signal.SIGKILL)
 
     def test_wrapper_identity_allows_brief_process_table_grace(self):
         check = RUNNER_API["wrapper_identity_matches_with_grace"]

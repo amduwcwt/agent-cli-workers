@@ -219,6 +219,17 @@ class GrokWorkerTests(unittest.TestCase):
         self.assertEqual(collected["exit_code"], 7)
         self.assertEqual(collected["result"]["text"], "fake result: FAIL")
 
+    def test_legacy_entry_forwards_deadline(self):
+        prompt = self.write_prompt("deadline.md", "SLEEP=30\ndeadline task")
+        proc, spawned = self.spawn(prompt, "--deadline-seconds", "0.2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(spawned["deadline_seconds"], 0.2)
+
+        finished = self.wait_state(spawned["worker_id"], {"failed"}, timeout=6)
+        self.assertEqual(finished["termination_reason"], "deadline_exceeded")
+        self.assertIn("deadline_at", finished)
+        self.assertIn("timed_out_at", finished)
+
     def test_followup_resumes_native_session(self):
         first_prompt = self.write_prompt("first.md", "first task")
         proc, first = self.spawn(first_prompt)

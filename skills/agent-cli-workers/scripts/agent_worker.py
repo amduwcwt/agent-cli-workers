@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -34,8 +34,9 @@ except ImportError:  # pragma: no cover - Unix lifecycle is the supported path.
 
 
 SCHEMA_VERSION = 2
-RUNNER_VERSION = "0.1.0"
+RUNNER_VERSION = "0.2.0"
 DEFAULT_SANDBOX = "read-only"
+DEADLINE_TERMINATION_GRACE_SECONDS = 3.0
 AGENTS = ("grok", "codex")
 CODEX_AGENTS = frozenset(("codex",))
 TERMINAL_STATES = {"succeeded", "failed", "cancelled", "lost"}
@@ -313,6 +314,10 @@ def public_metadata(metadata: dict) -> dict:
         "exit_code",
         "session_id",
         "parent_worker_id",
+        "deadline_seconds",
+        "deadline_at",
+        "timed_out_at",
+        "termination_reason",
         "model",
         "prompt_sha256",
         "result_path",
@@ -348,6 +353,7 @@ def create_worker(
     model: str | None,
     permission_mode: str | None,
     max_turns: int | None,
+    deadline_seconds: float | None,
     sandbox: str | None,
     dangerously_bypass_approvals_and_sandbox: bool,
     resume_session_id: str | None = None,
@@ -358,6 +364,10 @@ def create_worker(
         raise RunnerError("cwd_not_found", f"working directory does not exist: {working_directory}")
     if max_turns is not None and max_turns < 2:
         raise RunnerError("max_turns_too_low", "max-turns must be at least 2; omit it for the default")
+    if deadline_seconds is not None and (
+        not math.isfinite(deadline_seconds) or deadline_seconds <= 0
+    ):
+        raise RunnerError("invalid_deadline", "deadline-seconds must be finite and greater than zero")
     if dangerously_bypass_approvals_and_sandbox and sandbox:
         raise RunnerError("conflicting_options", "dangerous bypass cannot be combined with --sandbox")
 
@@ -390,6 +400,7 @@ def create_worker(
         "binary": resolved_binary,
         "permission_mode": permission_mode or "default",
         "max_turns": max_turns,
+        "deadline_seconds": deadline_seconds,
         "model": effective_model,
         "sandbox": effective_sandbox,
         "dangerously_bypass_approvals_and_sandbox": dangerously_bypass_approvals_and_sandbox,
@@ -565,6 +576,15 @@ def compact_capsule_payload(metadata: dict, result: dict | None) -> dict:
     }
     if result and result.get("requestId") is not None:
         payload["request_id"] = result["requestId"]
+    for key in (
+        "deadline_seconds",
+        "deadline_at",
+        "timed_out_at",
+        "termination_reason",
+        "runner_error",
+    ):
+        if metadata.get(key) is not None:
+            payload[key] = metadata[key]
     return payload
 
 
@@ -589,19 +609,28 @@ def signal_process_group(group_id: int | None, sig: signal.Signals) -> None:
         pass
 
 
-def stop_process_group(group_id: int | None, grace_seconds: float = 1.0) -> bool:
-    if not process_group_alive(group_id):
+def stop_process_group(
+    group_id: int | None,
+    grace_seconds: float = 1.0,
+    leader: subprocess.Popen | None = None,
+) -> bool:
+    def group_alive() -> bool:
+        if leader is not None:
+            leader.poll()
+        return process_group_alive(group_id)
+
+    if not group_alive():
         return True
     signal_process_group(group_id, signal.SIGTERM)
     deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline and process_group_alive(group_id):
+    while time.monotonic() < deadline and group_alive():
         time.sleep(0.05)
-    if process_group_alive(group_id):
+    if group_alive():
         signal_process_group(group_id, signal.SIGKILL)
         deadline = time.monotonic() + grace_seconds
-        while time.monotonic() < deadline and process_group_alive(group_id):
+        while time.monotonic() < deadline and group_alive():
             time.sleep(0.05)
-    return not process_group_alive(group_id)
+    return not group_alive()
 
 
 def claim_worker(worker_id: str) -> tuple[Path, dict]:
@@ -634,6 +663,8 @@ def run_worker(worker_id: str) -> int:
     child: subprocess.Popen | None = None
     child_group_id: int | None = None
     cancelled = False
+    deadline_exceeded = False
+    timed_out_at = None
 
     def request_cancel(_signum, _frame):
         nonlocal cancelled
@@ -666,16 +697,57 @@ def run_worker(worker_id: str) -> int:
                 "agent_pid": child.pid,
                 "agent_process_group_id": child_group_id,
             }
+            deadline_seconds = metadata.get("deadline_seconds")
+            deadline_monotonic = None
+            if deadline_seconds is not None:
+                deadline_started_at = datetime.now(timezone.utc)
+                deadline_monotonic = time.monotonic() + deadline_seconds
+                pid_changes["deadline_at"] = (
+                    deadline_started_at + timedelta(seconds=deadline_seconds)
+                ).isoformat().replace("+00:00", "Z")
             pid_changes["grok_pid" if agent == "grok" else "codex_pid"] = child.pid
             update_metadata(worker_id, **pid_changes)
             if cancelled or cancel_marker.exists():
                 signal_process_group(child_group_id, signal.SIGTERM)
-            exit_code = child.wait()
+            try:
+                wait_timeout = (
+                    max(0.0, deadline_monotonic - time.monotonic())
+                    if deadline_monotonic is not None
+                    else None
+                )
+                exit_code = child.wait(timeout=wait_timeout)
+            except subprocess.TimeoutExpired:
+                deadline_exceeded = True
+                timed_out_at = utc_now()
+                update_metadata(
+                    worker_id,
+                    timed_out_at=timed_out_at,
+                    termination_reason="deadline_exceeded",
+                )
+                stopped = stop_process_group(
+                    child_group_id,
+                    grace_seconds=DEADLINE_TERMINATION_GRACE_SECONDS,
+                    leader=child,
+                )
+                if not stopped:
+                    runner_error = (
+                        f"deadline exceeded after {deadline_seconds:g} seconds; "
+                        "agent process group did not terminate"
+                    )
+                else:
+                    runner_error = f"deadline exceeded after {deadline_seconds:g} seconds"
+                if child.returncode is None:
+                    try:
+                        child.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if child.returncode is not None:
+                    exit_code = child.returncode
     except Exception as exc:  # Wrapper failures must remain inspectable.
         runner_error = f"{type(exc).__name__}: {exc}"
         traceback.print_exc()
     finally:
-        if not stop_process_group(child_group_id) and runner_error is None:
+        if not stop_process_group(child_group_id, leader=child) and runner_error is None:
             runner_error = "agent process group did not terminate"
         if prompt_handle is not None:
             prompt_handle.close()
@@ -689,8 +761,13 @@ def run_worker(worker_id: str) -> int:
     was_cancelled = cancelled or cancel_marker.exists()
     if was_cancelled:
         state = "cancelled"
+        termination_reason = None
+    elif deadline_exceeded:
+        state = "failed"
+        termination_reason = "deadline_exceeded"
     elif runner_error is not None:
         state = "failed"
+        termination_reason = None
     elif (
         infer_agent(metadata) == "grok"
         and result is not None
@@ -698,8 +775,10 @@ def run_worker(worker_id: str) -> int:
     ):
         state = "failed"
         runner_error = f"Grok reported stopReason={result.get('stopReason')}"
+        termination_reason = None
     else:
         state = "succeeded" if exit_code == 0 else "failed"
+        termination_reason = None
     update_metadata(
         worker_id,
         state=state,
@@ -708,6 +787,8 @@ def run_worker(worker_id: str) -> int:
         session_id=session_id,
         result_truncated=result_truncated,
         runner_error=runner_error,
+        timed_out_at=timed_out_at,
+        termination_reason=termination_reason,
     )
     return 0 if state == "succeeded" else 1
 
@@ -884,6 +965,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         model=args.model,
         permission_mode=args.permission_mode,
         max_turns=args.max_turns,
+        deadline_seconds=args.deadline_seconds,
         sandbox=args.sandbox,
         dangerously_bypass_approvals_and_sandbox=args.dangerously_bypass_approvals_and_sandbox,
     )
@@ -973,6 +1055,12 @@ def cmd_followup(args: argparse.Namespace) -> int:
     parent = refreshed_metadata(args.worker_id)
     if parent.get("state") in ACTIVE_STATES:
         raise RunnerError("worker_running", "cannot follow up while the parent worker is active", 3)
+    if parent.get("termination_reason") == "deadline_exceeded":
+        raise RunnerError(
+            "deadline_session_not_resumable",
+            "a deadline-exceeded worker must not be resumed; narrow the task and start fresh",
+            4,
+        )
     session_id = parent.get("session_id")
     if not session_id:
         raise RunnerError("session_id_missing", "parent worker has no native session id", 4)
@@ -1035,6 +1123,7 @@ def cmd_followup(args: argparse.Namespace) -> int:
             model=args.model if args.model is not None else parent.get("model"),
             permission_mode=followup_permission_mode,
             max_turns=args.max_turns if args.max_turns is not None else parent.get("max_turns"),
+            deadline_seconds=args.deadline_seconds,
             sandbox=followup_sandbox,
             dangerously_bypass_approvals_and_sandbox=dangerous_bypass,
             resume_session_id=session_id,
@@ -1207,6 +1296,11 @@ def add_launch_options(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="Optional Grok cap for short closed checks; omit for research/source scans; must be >= 2",
     )
+    parser.add_argument(
+        "--deadline-seconds",
+        type=float,
+        help="Optional per-worker wall-clock deadline; finite and greater than zero; never inherited",
+    )
     parser.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"))
     parser.add_argument("--dangerously-bypass-approvals-and-sandbox", action="store_true")
 
@@ -1272,6 +1366,13 @@ def main() -> int:
             raise RunnerError("invalid_wait", "wait must be finite and non-negative")
         if hasattr(args, "timeout") and (not math.isfinite(args.timeout) or args.timeout < 0):
             raise RunnerError("invalid_timeout", "timeout must be finite and non-negative")
+        if hasattr(args, "deadline_seconds") and args.deadline_seconds is not None and (
+            not math.isfinite(args.deadline_seconds) or args.deadline_seconds <= 0
+        ):
+            raise RunnerError(
+                "invalid_deadline",
+                "deadline-seconds must be finite and greater than zero",
+            )
         if hasattr(args, "max_bytes") and args.max_bytes <= 0:
             raise RunnerError("invalid_max_bytes", "max-bytes must be positive")
         return args.func(args)
