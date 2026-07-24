@@ -1,0 +1,160 @@
+---
+name: grok-build-cli
+description: Call Grok Build CLI directly or through the shared durable asynchronous agent-cli-workers runner for research, review, coding, testing, native-session follow-up, and isolated work via caller-created git worktrees. Use when the user says “用 Grok”, “调用 Grok Build”, “让 Grok 做”, “Grok 作为 Codex 子 Agent”, asks Codex to keep working while Grok runs, requests a temporary Grok worktree, needs a Grok-specific direct call, or needs to diagnose Grok CLI/provider behavior. Existing grok_worker.py commands remain supported as a compatibility entry point; use agent-cli-workers for mixed Grok/Codex delegation and model selection.
+---
+
+# Grok Build CLI
+
+Call the configured Grok provider without changing its model, endpoint, or credentials:
+
+```text
+Codex -> Grok CLI -> configured Grok provider
+```
+
+Omit `--model` unless the user explicitly requests one. Never print, copy, or persist API keys.
+
+## Choose direct or asynchronous execution
+
+| Situation | Mode |
+|---|---|
+| Small task whose answer blocks further useful work | Direct headless call |
+| Grok can run while Codex inspects, edits, or tests independently | Shared async runner |
+| User explicitly requests an isolated Grok edit | Shared runner in a caller-created worktree |
+| Mixed Grok and Codex delegation | `agent-cli-workers` skill |
+
+Do not wait serially for an async worker while useful local work remains. Inspect `list --cwd <exact-cwd>` or `status` before starting a duplicate task. An unfiltered `list` is global and may contain workers from unrelated repositories.
+
+For mixed delegation, use `--agent codex` for the Codex worker. Model selection defaults to each installed CLI and can be configured through the shared runner.
+
+Use Grok as the primary worker for fast read-only investigation, bounded review, contract checking, and independent second opinions. Use Codex as the sole writer for implementation and test repair by default. Let Grok edit only when the user explicitly requests it, isolate that edit from every other writer, and never let Grok and Codex edit an overlapping file set.
+
+Require Grok to end with the same compact handoff used by the shared runner:
+
+```text
+STATUS: succeeded|blocked|failed
+WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
+SUMMARY: <one or two concise sentences; include highest-signal file:line findings for reviews>
+FILES: <comma-separated paths or none>
+VERIFY: <command => exit code; or not run with reason>
+RISKS: <none or concise unresolved risks>
+```
+
+For code-aware work, record the launch revision as `base` and the final revision as `head`; this remains unambiguous if a writer commits. For intentional non-Git research, use `root=non-git; base=none; head=none`. Reject mismatched workspace proof. Read full Grok output only to diagnose a failure; otherwise keep the main context to the completion capsule and independently verify any edits or claims.
+
+## Run an asynchronous Grok worker
+
+Use the shared lifecycle implementation:
+
+```bash
+RUNNER="${CODEX_HOME:-$HOME/.codex}/skills/agent-cli-workers/scripts/agent_worker.py"
+
+python3 "$RUNNER" spawn \
+  --agent grok \
+  --cwd <absolute-cwd> \
+  --prompt-file <absolute-task-file>
+```
+
+The command returns immediately. Prefer `--prompt-file` or `--prompt-stdin`; `--prompt` exposes task text in the caller's argv. Metadata stores no prompt body. Shared state lives under:
+
+```text
+${AGENT_CLI_WORKERS_STATE_DIR:-${CODEX_HOME:-~/.codex}/state/agent-cli-workers/workers}
+```
+
+The shared runner defaults Grok to `--sandbox read-only`. For an editing task, request `--sandbox workspace-write`. Add `--permission-mode bypassPermissions` only when the user separately authorizes non-interactive tool approval. Scope both choices to the requested task and exact CWD; neither authorizes unrelated or destructive operations.
+
+Never use `--max-turns 1`: a reasoning event can consume the only turn. Omit the cap by default; if explicitly bounding it, use at least `2`.
+
+### Observe and collect
+
+```bash
+python3 "$RUNNER" list --cwd "$PWD" --agent grok
+python3 "$RUNNER" status <worker-id>
+python3 "$RUNNER" collect <worker-id> --capsule
+python3 "$RUNNER" collect <worker-id> --capsule --wait 30
+# Failure diagnosis only:
+python3 "$RUNNER" collect <worker-id>
+```
+
+Capsule collection exits `0` for success, `1` for a terminal failure/cancellation, `3` while active, and `4` when a successful worker omitted a valid capsule. Avoid a blocking wait longer than 60 seconds. The compact result excludes Grok `thought` and token-usage payloads. Use ordinary `collect` only for failure diagnosis; it still allowlists Grok's result fields and never emits `thought`. Independently inspect delegated code changes and run focused verification.
+
+### Continue, cancel, and clean
+
+```bash
+python3 "$RUNNER" followup <worker-id> --prompt-file <absolute-follow-up-file>
+python3 "$RUNNER" cancel <worker-id>
+python3 "$RUNNER" cleanup <worker-id>
+```
+
+`followup` creates a new worker record and resumes the parent's native Grok `sessionId`. Grok requires the exact sandbox profile used to create that session. A `danger-full-access` parent therefore requires the flag again on every follow-up; use a fresh session to change profiles. Legacy sessions without a recorded sandbox profile are not resumed by the safe runner. `bypassPermissions` is never inherited. `cancel` verifies process identity and terminates the owned process group. A surviving Grok child whose wrapper died becomes `orphaned`; cleanup remains blocked until it is safely cancelled or otherwise terminal.
+
+Only one active worker may resume the same native session. Wait for or cancel it before starting another follow-up.
+
+The async cancellation path is verified for Unix/macOS systems with `ps` and process groups. Use direct mode on Windows.
+
+## Preserve legacy commands
+
+The former runner path is now a thin compatibility entry point:
+
+```bash
+LEGACY_RUNNER="${CODEX_HOME:-$HOME/.codex}/skills/grok-build-cli/scripts/grok_worker.py"
+
+python3 "$LEGACY_RUNNER" spawn \
+  --cwd <absolute-cwd> \
+  --prompt-file <absolute-task-file>
+```
+
+It injects `--agent grok`, filters legacy `list` output to Grok, maps `--grok-binary` to `--binary`, and gives an explicit `GROK_BUILD_CLI_STATE_DIR` precedence when mapping it to `AGENT_CLI_WORKERS_STATE_DIR`. Keep it for existing scripts; use the shared runner for new workflows.
+
+## Run a direct task
+
+Use direct headless mode only when the answer is immediately required:
+
+```bash
+grok --cwd <absolute-cwd> --no-plan --no-memory --no-subagents \
+  --output-format json -p '<self-contained task>'
+```
+
+Add `--permission-mode bypassPermissions` only with the authorization described above. Do not add `--check` before Grok produces the primary deliverable. If it returns only a plan or progress note, resume the saved session with a focused request for the completed result.
+
+## Choose the working directory
+
+| Task | Recommended CWD |
+|---|---|
+| Read, research, or review | Original repository |
+| Small requested edit | Original repository when conflicts are unlikely |
+| Parallel or isolated edit | Caller-created git worktree |
+
+On verified Grok Build 0.2.93, headless `--worktree` accepted the flag but did not create or switch a worktree. Re-test before relying on a newer version. Otherwise create isolation with Git and pass the exact path:
+
+```bash
+git -C <repo> worktree add -b <branch> <absolute-worktree> <ref>
+
+python3 "$RUNNER" spawn \
+  --agent grok \
+  --cwd <absolute-worktree> \
+  --sandbox workspace-write \
+  --permission-mode bypassPermissions \
+  --prompt-file <absolute-task-file>
+```
+
+After collection, inspect and verify the worktree, integrate or discard deliberately, then remove it with `git worktree remove`.
+
+## Diagnose failures
+
+1. Run `grok --version` and `grok models` without changing model selection.
+2. Run `grok inspect` in the target CWD.
+3. Before code work, require Grok to report `pwd`, `git rev-parse --show-toplevel`, and `git rev-parse HEAD`. Reject output whose reported workspace differs from the exact expected worktree.
+4. Never resume a native session after a workspace mismatch. Start fresh after checking the local worktree; two wrong filesystem views under the correct local CWD are a worker/provider workspace-view failure, not evidence about the target repository.
+5. Inspect runner `status`, `collect`, and `stderr_path`; do not mistake a live worker for failure.
+6. Distinguish a Grok provider failure from the outer Codex provider.
+7. Let CC Switch manage the Grok URL and key.
+
+Direct and async calls intentionally use the user's normal Grok configuration, including configured skills, hooks, plugins, and MCP servers.
+
+## Finish cleanly
+
+- collect Grok's final capsule and exit status with `--capsule`;
+- verify changed files and focused tests from Codex;
+- report worker ID, native session ID, and worktree when relevant;
+- cancel abandoned workers;
+- clean terminal worker state and temporary worktrees deliberately.
