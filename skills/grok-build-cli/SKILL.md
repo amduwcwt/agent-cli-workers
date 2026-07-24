@@ -62,7 +62,9 @@ ${AGENT_CLI_WORKERS_STATE_DIR:-${CODEX_HOME:-~/.codex}/state/agent-cli-workers/w
 
 The shared runner defaults Grok to `--sandbox read-only`. For an editing task, request `--sandbox workspace-write`. Add `--permission-mode bypassPermissions` only when the user separately authorizes non-interactive tool approval. Scope both choices to the requested task and exact CWD; neither authorizes unrelated or destructive operations.
 
-Never use `--max-turns 1`: a reasoning event can consume the only turn. Omit the cap by default; if explicitly bounding it, use at least `2`.
+Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations. Use it only for a short, closed check that should finish in a few tool turns; never use `1`, because a reasoning event can consume the only turn.
+
+For long work, split the task into bounded deliverables and set a concrete wall-clock deadline before spawning. The caller owns that deadline by polling `status` and cancelling when needed, and should state a token or cost budget when the provider supports one. Do not start uncapped long work when the caller cannot monitor and cancel it. If Grok reports `max turns reached` or another non-completion stop reason, collect diagnostics once and do not `followup` that native session merely to ask it to finish. Start fresh only after narrowing the task or deliberately removing the cap.
 
 ### Observe and collect
 

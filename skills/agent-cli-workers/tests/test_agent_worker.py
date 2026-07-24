@@ -237,6 +237,17 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertEqual(collected["result"]["text"], "grok result: grok task")
         self.assertEqual(collected["result"]["sessionId"], "grok-session-001")
         self.assertNotIn("PRIVATE_GROK_THOUGHT_MUST_NOT_LEAK", json.dumps(collected))
+        self.assertNotIn("--max-turns", self.invocations()[-1]["args"])
+
+    def test_grok_turn_cap_is_only_added_when_explicit(self):
+        prompt = self.write_prompt("grok-short-check.md", "short closed check")
+        proc, spawned = self.spawn("grok", prompt, "--max-turns", "3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        invocation = self.invocations()[-1]
+        cap_index = invocation["args"].index("--max-turns")
+        self.assertEqual(invocation["args"][cap_index + 1], "3")
 
     def test_collect_capsule_extracts_normalized_handoff_after_preface(self):
         prompt = self.write_prompt("grok-capsule.md", "RETURN_CAPSULE")

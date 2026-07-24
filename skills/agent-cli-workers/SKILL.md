@@ -45,6 +45,13 @@ Use both adapters only when tasks are independent or in a deliberate writer-revi
 - Two workers may receive the same contract only for an intentional read-only comparison.
 - The main session owns task decomposition, shared foundations, final diff review, verification, and integration.
 
+## Turn caps and long tasks
+
+- Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations. These tasks can consume the cap during evidence gathering before producing a completion capsule.
+- Use `--max-turns` only for a short, closed check that should finish in a few tool turns. Treat it as an explicit per-task limit, never a default safety setting.
+- Before starting a long task, split it into bounded deliverables and set a concrete wall-clock deadline. The caller owns that deadline by polling `status` and cancelling when it is reached; state a token or cost budget in the task or provider configuration when one is available. Do not start uncapped long work when the caller cannot monitor and cancel it. The runner does not currently enforce a wall-clock or token budget automatically.
+- If a worker fails with `max turns reached` or a corresponding non-completion stop reason, collect diagnostics once and do not `followup` that native session merely to request the missing conclusion. Start a fresh worker only after narrowing the task or deliberately removing the cap.
+
 ## Isolation policy
 
 - Use the original repository for read-only work and for one low-conflict writer.
@@ -112,7 +119,7 @@ python3 "$RUNNER" spawn \
 | Option | Grok | Codex |
 |---|---|---|
 | `--permission-mode` | ✅ | ⚠️ unsupported |
-| `--max-turns` | ✅ | ⚠️ unsupported |
+| `--max-turns` | ✅ short checks only; omit for research/source scans | ⚠️ unsupported |
 | `--sandbox` | pass-through | ✅ |
 | `--dangerously-bypass-approvals-and-sandbox` | ⚠️ unsupported | ✅ |
 | `--model` | pass-through except disabled models | pass-through except disabled models |
@@ -134,7 +141,6 @@ python3 "$RUNNER" spawn \
   --agent grok \
   --cwd "$WORKDIR" \
   --permission-mode auto \
-  --max-turns 4 \
   --sandbox read-only \
   --prompt-file "$PROMPT"
 ```
@@ -188,9 +194,10 @@ Use the exact repository or worktree path with `list --cwd` before deciding whet
 2. Compare that workspace proof with the exact `--cwd` and expected revision. Treat metadata and launch arguments as routing evidence, not proof of the provider's filesystem view.
 3. If any value mismatches, reject the result, cancel the worker, and never `followup` that native session. Start a fresh session only after rechecking the local worktree.
 4. If a fresh Grok session sees the wrong filesystem twice under the correct local CWD, stop retrying and report a worker/provider workspace-view failure.
-5. Use one primary worker by default. For writer-reviewer work, wait for the Codex writer to finish, then give Grok a read-only review at the fixed worktree or commit.
-6. Collect with `--capsule`, review diffs, and independently rerun focused verification before integration.
-7. `cleanup` workers and remove temporary worktrees if created.
+5. If Grok reaches a turn cap without a completion capsule, diagnose once and do not resume that session just to ask it to finish. Narrow the work and start fresh only when another attempt is justified.
+6. Use one primary worker by default. For writer-reviewer work, wait for the Codex writer to finish, then give Grok a read-only review at the fixed worktree or commit.
+7. Collect with `--capsule`, review diffs, and independently rerun focused verification before integration.
+8. `cleanup` workers and remove temporary worktrees if created.
 
 ## Notes
 

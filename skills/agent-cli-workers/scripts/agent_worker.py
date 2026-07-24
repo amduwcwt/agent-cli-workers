@@ -1202,7 +1202,11 @@ def add_launch_options(parser: argparse.ArgumentParser) -> None:
         "--permission-mode",
         choices=("default", "acceptEdits", "auto", "dontAsk", "bypassPermissions", "plan"),
     )
-    parser.add_argument("--max-turns", type=int, help="Optional Grok agent turn cap; must be >= 2")
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        help="Optional Grok cap for short closed checks; omit for research/source scans; must be >= 2",
+    )
     parser.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"))
     parser.add_argument("--dangerously-bypass-approvals-and-sandbox", action="store_true")
 

@@ -2,7 +2,7 @@
 
 ## Boundary
 
-`agent_worker.py` is a local lifecycle adapter, not an orchestrator control plane. Every public command emits one JSON object. The controlling agent or human owns task decomposition, worktree creation, result review, verification, and integration.
+`agent_worker.py` is a local lifecycle adapter, not an orchestrator control plane. Every public command emits one JSON object. The controlling agent or human owns task decomposition, worktree creation, result review, verification, integration, wall-clock deadlines, and token or cost budgets. The runner does not add a turn cap unless the caller explicitly requests one.
 
 ## Lifecycle
 

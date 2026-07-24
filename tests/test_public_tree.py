@@ -62,6 +62,18 @@ class PublicTreeTests(unittest.TestCase):
             }
             self.assertEqual(keys, {"name", "description"}, path)
 
+    def test_long_research_omits_turn_caps_by_default(self):
+        shared = (ROOT / "skills" / "agent-cli-workers" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        grok = (ROOT / "skills" / "grok-build-cli" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        for text in (shared, grok):
+            self.assertIn("Omit `--max-turns` for multi-source research", text)
+            self.assertIn("do not `followup` that native session", text)
+        self.assertNotIn("--max-turns 4", shared)
+
 
 if __name__ == "__main__":
     unittest.main()

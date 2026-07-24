@@ -98,6 +98,12 @@ Use ordinary `collect` only to diagnose a terminal failure. Even diagnostic coll
 
 For an editing worker, choose `--agent codex --sandbox workspace-write`. Create and clean any isolation worktree yourself; the runner never changes Git topology.
 
+## Turn caps and long tasks
+
+The runner does not set a turn cap by default. Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations; evidence gathering can exhaust the cap before the worker produces a completion capsule. Use the option only for a short, closed Grok check that should finish in a few tool turns.
+
+Split long work into bounded deliverables and set a concrete wall-clock deadline before spawning. The caller owns that deadline through `status` and `cancel`, and should set a token or cost budget in the task or provider when available. Do not start uncapped long work when it cannot be monitored and cancelled. The runner does not currently enforce either budget automatically. After a `max turns reached` failure, collect diagnostics once and do not resume the same native session merely to ask for the missing conclusion.
+
 ## Model policy
 
 By default the runner does not pass a model to either CLI. This preserves each user's existing CLI configuration.
