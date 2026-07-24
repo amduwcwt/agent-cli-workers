@@ -756,6 +756,19 @@ def wrapper_identity_matches(worker_id: str, pid: int) -> bool:
     )
 
 
+def queued_wrapper_identity_matches(worker_id: str, pid: int) -> bool:
+    if wrapper_identity_matches(worker_id, pid):
+        return True
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        if not is_pid_alive(pid):
+            return False
+        time.sleep(0.025)
+        if wrapper_identity_matches(worker_id, pid):
+            return True
+    return False
+
+
 def binary_identity_matches(argv: list[str], expected_binary: str) -> bool:
     if not expected_binary:
         return False
@@ -805,7 +818,10 @@ def refreshed_metadata(worker_id: str) -> dict:
             return metadata
         wrapper_pid = metadata.get("wrapper_pid")
         wrapper_alive = is_pid_alive(wrapper_pid)
-        wrapper_matches = wrapper_alive and wrapper_identity_matches(worker_id, wrapper_pid)
+        if wrapper_alive and metadata.get("state") == "queued":
+            wrapper_matches = queued_wrapper_identity_matches(worker_id, wrapper_pid)
+        else:
+            wrapper_matches = wrapper_alive and wrapper_identity_matches(worker_id, wrapper_pid)
         if wrapper_matches:
             return metadata
         identity_mismatch = wrapper_alive and not wrapper_matches

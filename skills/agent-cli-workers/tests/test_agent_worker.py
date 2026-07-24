@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -738,6 +739,19 @@ class AgentWorkerTests(unittest.TestCase):
         cleanup_proc, cleaned = self.run_cli("cleanup", worker_id)
         self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
         self.assertEqual(cleaned["state"], "cleaned")
+
+    def test_queued_wrapper_identity_allows_brief_startup_grace(self):
+        check = RUNNER_API["queued_wrapper_identity_matches"]
+        identity = mock.Mock(side_effect=(False, False, True))
+        with mock.patch.dict(
+            check.__globals__,
+            {
+                "is_pid_alive": mock.Mock(return_value=True),
+                "wrapper_identity_matches": identity,
+            },
+        ):
+            self.assertTrue(check("queued-worker", 12345))
+        self.assertEqual(identity.call_count, 3)
 
     def test_cancel_terminates_agent_descendants(self):
         child_pid_path = self.root / "descendant.pid"
