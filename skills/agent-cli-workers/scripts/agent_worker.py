@@ -34,7 +34,8 @@ except ImportError:  # pragma: no cover - Unix lifecycle is the supported path.
 
 
 SCHEMA_VERSION = 2
-RUNNER_VERSION = "0.2.0"
+RUNNER_VERSION = "0.3.0"
+HISTORY_SCHEMA_VERSION = 1
 DEFAULT_SANDBOX = "read-only"
 DEADLINE_TERMINATION_GRACE_SECONDS = 3.0
 AGENTS = ("grok", "codex")
@@ -45,7 +46,58 @@ WORKER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 MAX_PROMPT_BYTES = 1024 * 1024
 DEFAULT_COLLECT_BYTES = 2 * 1024 * 1024
 MAX_COMPLETION_CAPSULE_BYTES = 16 * 1024
+MAX_TELEMETRY_CLASSIFY_BYTES = 64 * 1024
 SCRIPT_PATH = Path(__file__).resolve()
+TASK_CLASSES = (
+    "unknown",
+    "research",
+    "investigation",
+    "review",
+    "implementation",
+    "test-repair",
+    "refactor",
+    "other",
+)
+ROUTE_REASONS = (
+    "unknown",
+    "fast-readonly",
+    "default-writer",
+    "user-provider-choice",
+    "independent-review",
+    "followup",
+    "other",
+)
+CONTROLLER_OUTCOMES = ("accepted", "partial", "rejected")
+VERIFICATION_OUTCOMES = ("passed", "failed", "not-run")
+OUTCOME_REASON_CODES = (
+    "none",
+    "wrong-provider",
+    "workspace-mismatch",
+    "verification-failed",
+    "completion-capsule-invalid",
+    "provider-error",
+    "deadline-exceeded",
+    "max-turns",
+    "too-slow",
+    "redundant-authorization-prompt",
+    "scope-mismatch",
+    "other",
+)
+FAILURE_CLASSES = (
+    "none",
+    "deadline_exceeded",
+    "cancelled",
+    "lost",
+    "max_turns",
+    "provider_noncompletion",
+    "provider_http_403",
+    "provider_http_429",
+    "provider_http_503",
+    "runner_error",
+    "exit_nonzero",
+    "failed_unknown",
+)
+USAGE_FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens", "total_tokens")
 GROK_RESULT_FIELDS = (
     "text",
     "stopReason",
@@ -107,6 +159,56 @@ def state_root() -> Path:
             5,
         )
     return root
+
+
+def telemetry_enabled() -> bool:
+    value = os.environ.get("AGENT_CLI_WORKERS_TELEMETRY", "1").strip().casefold()
+    return value not in {"0", "false", "no", "off"}
+
+
+def history_root() -> Path:
+    override = os.environ.get("AGENT_CLI_WORKERS_HISTORY_DIR")
+    if override:
+        candidate = Path(override).expanduser()
+    else:
+        candidate = state_root().parent / "history"
+    if candidate.is_symlink():
+        raise RunnerError("unsafe_history_dir", "history directory must not be a symlink", 5)
+    try:
+        candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root = candidate.resolve()
+        root_stat = root.stat()
+    except OSError as exc:
+        raise RunnerError("history_dir_unavailable", f"cannot initialize history directory: {exc}", 5) from exc
+    workers = state_root()
+    if root == workers or workers in root.parents or root in workers.parents:
+        raise RunnerError("unsafe_history_dir", "history directory must be separate from worker state", 5)
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid():
+        raise RunnerError("unsafe_history_dir", "history directory must be an owned directory", 5)
+    if stat.S_IMODE(root_stat.st_mode) & 0o077:
+        raise RunnerError(
+            "insecure_history_dir",
+            "history directory must not grant group or other access",
+            5,
+        )
+    return root
+
+
+def history_path(worker_id: str) -> Path:
+    validate_worker_id(worker_id)
+    root = history_root()
+    path = root / f"{worker_id}.json"
+    if path.is_symlink() or path.parent != root:
+        raise RunnerError("unsafe_history_path", "history summary path is unsafe", 5)
+    return path
+
+
+def skill_sha256() -> str | None:
+    path = SCRIPT_PATH.parents[1] / "SKILL.md"
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def validate_worker_id(worker_id: str) -> None:
@@ -314,6 +416,8 @@ def public_metadata(metadata: dict) -> dict:
         "exit_code",
         "session_id",
         "parent_worker_id",
+        "task_class",
+        "route_reason",
         "deadline_seconds",
         "deadline_at",
         "timed_out_at",
@@ -354,6 +458,8 @@ def create_worker(
     permission_mode: str | None,
     max_turns: int | None,
     deadline_seconds: float | None,
+    task_class: str,
+    route_reason: str,
     sandbox: str | None,
     dangerously_bypass_approvals_and_sandbox: bool,
     resume_session_id: str | None = None,
@@ -397,10 +503,13 @@ def create_worker(
         "created_at": created_at,
         "updated_at": created_at,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "skill_sha256": skill_sha256(),
         "binary": resolved_binary,
         "permission_mode": permission_mode or "default",
         "max_turns": max_turns,
         "deadline_seconds": deadline_seconds,
+        "task_class": task_class,
+        "route_reason": route_reason,
         "model": effective_model,
         "sandbox": effective_sandbox,
         "dangerously_bypass_approvals_and_sandbox": dangerously_bypass_approvals_and_sandbox,
@@ -586,6 +695,312 @@ def compact_capsule_payload(metadata: dict, result: dict | None) -> dict:
         if metadata.get(key) is not None:
             payload[key] = metadata[key]
     return payload
+
+
+def parse_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def file_size(value: object) -> int:
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        size = Path(value).stat().st_size
+    except OSError:
+        return 0
+    return max(0, int(size))
+
+
+def canonical_usage(result: dict | None) -> dict | None:
+    usage = result.get("usage") if isinstance(result, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    normalized = {}
+    for key in USAGE_FIELDS:
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        normalized[key] = value
+    return normalized or None
+
+
+def capsule_metrics(result: dict | None) -> dict:
+    text = result.get("text") if isinstance(result, dict) else None
+    capsule = extract_completion_capsule(text)
+    if capsule is not None:
+        return {"status": "valid", "bytes": len(capsule.encode("utf-8"))}
+    if isinstance(text, str) and text:
+        return {"status": "invalid", "bytes": 0}
+    return {"status": "missing", "bytes": 0}
+
+
+def failure_class(metadata: dict, result: dict | None) -> str:
+    if metadata.get("termination_reason") == "deadline_exceeded":
+        return "deadline_exceeded"
+    state = metadata.get("state")
+    if state == "cancelled":
+        return "cancelled"
+    if state == "lost":
+        return "lost"
+    stop_reason = result.get("stopReason") if isinstance(result, dict) else None
+    if isinstance(stop_reason, str) and stop_reason not in ("", "EndTurn"):
+        normalized = stop_reason.casefold()
+        if "turn" in normalized and ("max" in normalized or "limit" in normalized):
+            return "max_turns"
+        return "provider_noncompletion"
+    exit_code = metadata.get("exit_code")
+    is_failure = (
+        state == "failed"
+        or bool(metadata.get("runner_error"))
+        or (isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0)
+    )
+    if not is_failure:
+        return "none"
+    stderr, _ = read_limited(Path(metadata.get("stderr_path") or ""), MAX_TELEMETRY_CLASSIFY_BYTES)
+    lowered = stderr.casefold()
+    if re.search(r"\bmax(?:imum)?[-_ ]*turns?\b|\bturns?[-_ ]*limit\b", lowered):
+        return "max_turns"
+    for status in (403, 429, 503):
+        if f"status {status}" in lowered or f"http_status\": {status}" in lowered:
+            return f"provider_http_{status}"
+    if metadata.get("runner_error"):
+        return "runner_error"
+    if isinstance(exit_code, int) and exit_code != 0:
+        return "exit_nonzero"
+    if state == "failed":
+        return "failed_unknown"
+    return "none"
+
+
+def load_history_summary(worker_id: str, *, require_exists: bool = True) -> dict | None:
+    path = history_path(worker_id)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if require_exists:
+            raise RunnerError("history_not_found", f"history for worker {worker_id!r} was not found", 4)
+        return None
+    except OSError as exc:
+        raise RunnerError("history_read_failed", f"cannot read worker history: {exc}", 5) from exc
+    try:
+        summary = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RunnerError("history_corrupt", f"history for worker {worker_id!r} is invalid", 5) from exc
+    if not isinstance(summary, dict) or summary.get("worker_id") != worker_id:
+        raise RunnerError("history_corrupt", f"history for worker {worker_id!r} is invalid", 5)
+    if summary.get("history_schema_version") != HISTORY_SCHEMA_VERSION:
+        raise RunnerError(
+            "history_schema_unsupported",
+            f"history for worker {worker_id!r} uses an unsupported schema",
+            5,
+        )
+    return summary
+
+
+def build_history_summary(metadata: dict, existing: dict | None = None) -> dict:
+    result, result_truncated = parsed_result(metadata)
+    started_at = parse_utc(metadata.get("started_at"))
+    finished_at = parse_utc(metadata.get("finished_at"))
+    duration_seconds = None
+    if started_at is not None and finished_at is not None:
+        duration_seconds = max(0.0, round((finished_at - started_at).total_seconds(), 6))
+    recorded_at = (existing or {}).get("recorded_at") or utc_now()
+    existing_controller = (existing or {}).get("controller")
+    preserve_controller_labels = (
+        isinstance(existing_controller, dict)
+        and existing_controller.get("provenance") == "controller"
+    )
+    task_class = metadata.get("task_class") or "unknown"
+    route_reason = metadata.get("route_reason") or "unknown"
+    if preserve_controller_labels and (existing or {}).get("task_class") in TASK_CLASSES:
+        task_class = existing["task_class"]
+    if preserve_controller_labels and (existing or {}).get("route_reason") in ROUTE_REASONS:
+        route_reason = existing["route_reason"]
+    summary = {
+        "history_schema_version": HISTORY_SCHEMA_VERSION,
+        "worker_id": metadata["worker_id"],
+        "recorded_at": recorded_at,
+        "updated_at": utc_now(),
+        "finished_at": metadata.get("finished_at"),
+        "runner_version": metadata.get("runner_version"),
+        "skill_sha256": metadata.get("skill_sha256") or skill_sha256(),
+        "agent": infer_agent(metadata),
+        "model": metadata.get("model"),
+        "sandbox": metadata.get("sandbox"),
+        "task_class": task_class,
+        "route_reason": route_reason,
+        "state": metadata.get("state"),
+        "failure_class": failure_class(metadata, result),
+        "exit_code": metadata.get("exit_code"),
+        "duration_seconds": duration_seconds,
+        "parent_worker_id": metadata.get("parent_worker_id"),
+        "usage": canonical_usage(result),
+        "artifacts": {
+            "stdout_bytes": file_size(metadata.get("result_path")),
+            "stderr_bytes": file_size(metadata.get("stderr_path")),
+            "wrapper_log_bytes": file_size(metadata.get("wrapper_log_path")),
+            "final_output_bytes": file_size(metadata.get("final_output_path")),
+        },
+        "capsule": capsule_metrics(result),
+        "result_truncated": bool(metadata.get("result_truncated") or result_truncated),
+        "controller": existing_controller,
+    }
+    return summary
+
+
+def history_source_directory(metadata: dict) -> Path | None:
+    result_path = metadata.get("result_path")
+    if not isinstance(result_path, str) or not result_path:
+        return None
+    return Path(result_path).parent
+
+
+def snapshot_history_locked(metadata: dict) -> dict | None:
+    existing = load_history_summary(metadata["worker_id"], require_exists=False)
+    source_directory = history_source_directory(metadata)
+    if source_directory is None or not source_directory.is_dir():
+        return existing
+    result_path = metadata.get("result_path")
+    stderr_path = metadata.get("stderr_path")
+    if existing is not None and (
+        not isinstance(result_path, str)
+        or not Path(result_path).is_file()
+        or not isinstance(stderr_path, str)
+        or not Path(stderr_path).is_file()
+    ):
+        return existing
+    summary = build_history_summary(metadata, existing)
+    atomic_write_json(history_path(metadata["worker_id"]), summary)
+    return summary
+
+
+def snapshot_history(metadata: dict) -> dict | None:
+    if not telemetry_enabled():
+        return None
+    root = history_root()
+    with worker_lock(root):
+        return snapshot_history_locked(metadata)
+
+
+def best_effort_snapshot_history(metadata: dict) -> None:
+    if not telemetry_enabled():
+        return
+    try:
+        snapshot_history(metadata)
+    except Exception:
+        traceback.print_exc()
+
+
+def discard_history(worker_id: str) -> None:
+    try:
+        path = history_path(worker_id)
+    except RunnerError:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def canonical_history_summary(summary: dict) -> dict:
+    def safe_string(value: object, *, maximum: int = 128) -> str | None:
+        if not isinstance(value, str) or not value or len(value) > maximum:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+@-]*", value):
+            return None
+        return value
+
+    def safe_timestamp(value: object) -> str | None:
+        return value if isinstance(value, str) and parse_utc(value) is not None else None
+
+    def safe_nonnegative_number(value: object) -> int | float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value) or value < 0:
+            return None
+        return value
+
+    def safe_nonnegative_int(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    worker_id = summary["worker_id"]
+    artifacts = summary.get("artifacts") if isinstance(summary.get("artifacts"), dict) else {}
+    capsule = summary.get("capsule") if isinstance(summary.get("capsule"), dict) else {}
+    capsule_status = capsule.get("status")
+    if capsule_status not in {"valid", "invalid", "missing"}:
+        capsule_status = "missing"
+    parent_worker_id = summary.get("parent_worker_id")
+    if not isinstance(parent_worker_id, str) or not WORKER_ID_RE.fullmatch(parent_worker_id):
+        parent_worker_id = None
+    exit_code = summary.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = None
+    skill_hash = summary.get("skill_sha256")
+    if not isinstance(skill_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", skill_hash):
+        skill_hash = None
+    return {
+        "history_schema_version": HISTORY_SCHEMA_VERSION,
+        "worker_id": worker_id,
+        "recorded_at": safe_timestamp(summary.get("recorded_at")) or utc_now(),
+        "updated_at": utc_now(),
+        "finished_at": safe_timestamp(summary.get("finished_at")),
+        "runner_version": safe_string(summary.get("runner_version")),
+        "skill_sha256": skill_hash,
+        "agent": summary.get("agent") if summary.get("agent") in AGENTS else "unknown",
+        "model": safe_string(summary.get("model")),
+        "sandbox": (
+            summary.get("sandbox")
+            if summary.get("sandbox") in {"read-only", "workspace-write", "danger-full-access"}
+            else None
+        ),
+        "task_class": (
+            summary.get("task_class") if summary.get("task_class") in TASK_CLASSES else "unknown"
+        ),
+        "route_reason": (
+            summary.get("route_reason")
+            if summary.get("route_reason") in ROUTE_REASONS
+            else "unknown"
+        ),
+        "state": (
+            summary.get("state")
+            if summary.get("state") in TERMINAL_STATES | ACTIVE_STATES
+            else "unknown"
+        ),
+        "failure_class": (
+            summary.get("failure_class")
+            if summary.get("failure_class") in FAILURE_CLASSES
+            else "unknown"
+        ),
+        "exit_code": exit_code,
+        "duration_seconds": safe_nonnegative_number(summary.get("duration_seconds")),
+        "parent_worker_id": parent_worker_id,
+        "usage": canonical_usage({"usage": summary.get("usage")}),
+        "artifacts": {
+            key: safe_nonnegative_int(artifacts.get(key))
+            for key in (
+                "stdout_bytes",
+                "stderr_bytes",
+                "wrapper_log_bytes",
+                "final_output_bytes",
+            )
+        },
+        "capsule": {
+            "status": capsule_status,
+            "bytes": safe_nonnegative_int(capsule.get("bytes")),
+        },
+        "result_truncated": bool(summary.get("result_truncated")),
+        "controller": None,
+    }
 
 
 def process_group_alive(group_id: int | None) -> bool:
@@ -779,7 +1194,7 @@ def run_worker(worker_id: str) -> int:
     else:
         state = "succeeded" if exit_code == 0 else "failed"
         termination_reason = None
-    update_metadata(
+    final_metadata = update_metadata(
         worker_id,
         state=state,
         exit_code=exit_code,
@@ -790,6 +1205,7 @@ def run_worker(worker_id: str) -> int:
         timed_out_at=timed_out_at,
         termination_reason=termination_reason,
     )
+    best_effort_snapshot_history(final_metadata)
     return 0 if state == "succeeded" else 1
 
 
@@ -966,6 +1382,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         permission_mode=args.permission_mode,
         max_turns=args.max_turns,
         deadline_seconds=args.deadline_seconds,
+        task_class=args.task_class,
+        route_reason=args.route_reason,
         sandbox=args.sandbox,
         dangerously_bypass_approvals_and_sandbox=args.dangerously_bypass_approvals_and_sandbox,
     )
@@ -974,7 +1392,10 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    emit(public_metadata(refreshed_metadata(args.worker_id)))
+    metadata = refreshed_metadata(args.worker_id)
+    if metadata.get("state") in TERMINAL_STATES:
+        best_effort_snapshot_history(metadata)
+    emit(public_metadata(metadata))
     return 0
 
 
@@ -1010,6 +1431,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         return 3
 
     result, result_truncated = parsed_result(metadata, args.max_bytes)
+    best_effort_snapshot_history(metadata)
     if args.capsule:
         payload = compact_capsule_payload(metadata, result)
         capsule = extract_completion_capsule(result.get("text") if result else None)
@@ -1124,6 +1546,8 @@ def cmd_followup(args: argparse.Namespace) -> int:
             permission_mode=followup_permission_mode,
             max_turns=args.max_turns if args.max_turns is not None else parent.get("max_turns"),
             deadline_seconds=args.deadline_seconds,
+            task_class=args.task_class,
+            route_reason=args.route_reason,
             sandbox=followup_sandbox,
             dangerously_bypass_approvals_and_sandbox=dangerous_bypass,
             resume_session_id=session_id,
@@ -1261,6 +1685,232 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_record_outcome(args: argparse.Namespace) -> int:
+    if not telemetry_enabled():
+        raise RunnerError("telemetry_disabled", "telemetry is disabled", 4)
+    try:
+        summary = load_history_summary(args.worker_id)
+    except RunnerError as exc:
+        if exc.error != "history_not_found":
+            raise
+        metadata = refreshed_metadata(args.worker_id)
+        if metadata.get("state") in ACTIVE_STATES:
+            raise RunnerError("worker_running", "cannot record outcome while worker is active", 3)
+        snapshot_history(metadata)
+        summary = load_history_summary(args.worker_id)
+    reason_codes = list(dict.fromkeys(args.reason_code or []))
+    if "none" in reason_codes and len(reason_codes) > 1:
+        raise RunnerError("conflicting_reason_codes", "reason code 'none' cannot be combined", 2)
+    root = history_root()
+    with worker_lock(root):
+        summary = canonical_history_summary(load_history_summary(args.worker_id))
+        if args.task_class is not None:
+            summary["task_class"] = args.task_class
+        if args.route_reason is not None:
+            summary["route_reason"] = args.route_reason
+        summary["controller"] = {
+            "provenance": "controller",
+            "recorded_at": utc_now(),
+            "outcome": args.outcome,
+            "verification": args.verification,
+            "reason_codes": reason_codes,
+        }
+        summary["updated_at"] = utc_now()
+        atomic_write_json(history_path(args.worker_id), summary)
+    emit(
+        {
+            "history_schema_version": HISTORY_SCHEMA_VERSION,
+            "worker_id": summary["worker_id"],
+            "task_class": summary["task_class"],
+            "route_reason": summary["route_reason"],
+            "controller": summary["controller"],
+        }
+    )
+    return 0
+
+
+def increment_count(mapping: dict, key: object, allowed: object = None) -> None:
+    normalized = key if isinstance(key, str) and key else "unknown"
+    if allowed is not None and normalized not in allowed:
+        normalized = "unknown"
+    mapping[normalized] = mapping.get(normalized, 0) + 1
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    if not telemetry_enabled():
+        emit({"history_schema_version": HISTORY_SCHEMA_VERSION, "telemetry": "disabled", "runs": 0})
+        return 0
+    root = history_root()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.since_days)
+    summaries = []
+    corrupt = 0
+    unsupported = 0
+    with worker_lock(root):
+        for path in sorted(root.glob("*.json")):
+            if path.is_symlink():
+                corrupt += 1
+                continue
+            worker_id = path.stem
+            try:
+                summary = load_history_summary(worker_id)
+            except RunnerError as exc:
+                if exc.error == "history_schema_unsupported":
+                    unsupported += 1
+                else:
+                    corrupt += 1
+                continue
+            recorded_at = parse_utc(summary.get("recorded_at"))
+            if recorded_at is None or recorded_at < cutoff:
+                continue
+            if args.agent is not None and summary.get("agent") != args.agent:
+                continue
+            summaries.append(summary)
+
+    report = {
+        "history_schema_version": HISTORY_SCHEMA_VERSION,
+        "generated_at": utc_now(),
+        "since_days": args.since_days,
+        "runs": len(summaries),
+        "root_runs": 0,
+        "followup_runs": 0,
+        "corrupt_summaries": corrupt,
+        "unsupported_summaries": unsupported,
+        "by_agent": {},
+        "by_task_class": {},
+        "by_route_reason": {},
+        "by_state": {},
+        "by_failure_class": {},
+        "by_outcome": {},
+        "by_verification": {},
+        "by_reason_code": {},
+        "feedback": {"denominator": "runs", "recorded": 0, "missing": 0, "missing_rate": 0.0},
+        "usage": {"denominator": "runs", "present": 0, "missing": 0},
+        "usage_totals": {key: 0 for key in USAGE_FIELDS},
+        "capsules": {
+            "denominator": "runs",
+            "valid": 0,
+            "invalid": 0,
+            "missing": 0,
+        },
+        "artifact_bytes": {
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "wrapper_log_bytes": 0,
+            "final_output_bytes": 0,
+            "capsule_bytes": 0,
+        },
+        "duration": {"denominator": "runs_with_duration", "count": 0, "total_seconds": 0.0, "average_seconds": None},
+    }
+    for summary in summaries:
+        if summary.get("parent_worker_id"):
+            report["followup_runs"] += 1
+        else:
+            report["root_runs"] += 1
+        increment_count(report["by_agent"], summary.get("agent"), AGENTS)
+        increment_count(report["by_task_class"], summary.get("task_class"), TASK_CLASSES)
+        increment_count(report["by_route_reason"], summary.get("route_reason"), ROUTE_REASONS)
+        increment_count(
+            report["by_state"],
+            summary.get("state"),
+            TERMINAL_STATES | ACTIVE_STATES,
+        )
+        increment_count(
+            report["by_failure_class"],
+            summary.get("failure_class"),
+            FAILURE_CLASSES,
+        )
+        controller = summary.get("controller")
+        if isinstance(controller, dict) and controller.get("provenance") == "controller":
+            report["feedback"]["recorded"] += 1
+            increment_count(
+                report["by_outcome"], controller.get("outcome"), CONTROLLER_OUTCOMES
+            )
+            increment_count(
+                report["by_verification"],
+                controller.get("verification"),
+                VERIFICATION_OUTCOMES,
+            )
+            reasons = controller.get("reason_codes")
+            if isinstance(reasons, list):
+                for reason in reasons:
+                    increment_count(report["by_reason_code"], reason, OUTCOME_REASON_CODES)
+            elif reasons is not None:
+                increment_count(report["by_reason_code"], "unknown", OUTCOME_REASON_CODES)
+        else:
+            report["feedback"]["missing"] += 1
+        usage = summary.get("usage")
+        if isinstance(usage, dict):
+            report["usage"]["present"] += 1
+            for key in USAGE_FIELDS:
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    report["usage_totals"][key] += value
+        else:
+            report["usage"]["missing"] += 1
+        capsule = summary.get("capsule") if isinstance(summary.get("capsule"), dict) else {}
+        capsule_status = capsule.get("status")
+        if capsule_status not in {"valid", "invalid", "missing"}:
+            capsule_status = "missing"
+        report["capsules"][capsule_status] += 1
+        capsule_bytes = capsule.get("bytes")
+        if isinstance(capsule_bytes, int) and not isinstance(capsule_bytes, bool) and capsule_bytes >= 0:
+            report["artifact_bytes"]["capsule_bytes"] += capsule_bytes
+        artifacts = summary.get("artifacts") if isinstance(summary.get("artifacts"), dict) else {}
+        for key in ("stdout_bytes", "stderr_bytes", "wrapper_log_bytes", "final_output_bytes"):
+            value = artifacts.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                report["artifact_bytes"][key] += value
+        duration = summary.get("duration_seconds")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool) and math.isfinite(duration) and duration >= 0:
+            report["duration"]["count"] += 1
+            report["duration"]["total_seconds"] += duration
+    runs = report["runs"]
+    if runs:
+        report["feedback"]["missing_rate"] = round(report["feedback"]["missing"] / runs, 6)
+    duration_count = report["duration"]["count"]
+    report["duration"]["total_seconds"] = round(report["duration"]["total_seconds"], 6)
+    if duration_count:
+        report["duration"]["average_seconds"] = round(
+            report["duration"]["total_seconds"] / duration_count,
+            6,
+        )
+    emit(report)
+    return 0
+
+
+def cmd_purge_history(args: argparse.Namespace) -> int:
+    root = history_root()
+    cutoff = (
+        None
+        if args.all
+        else datetime.now(timezone.utc) - timedelta(days=args.older_than_days)
+    )
+    removed = 0
+    skipped = 0
+    with worker_lock(root):
+        for path in sorted(root.glob("*.json")):
+            if path.is_symlink():
+                skipped += 1
+                continue
+            if cutoff is not None:
+                try:
+                    summary = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    skipped += 1
+                    continue
+                recorded_at = parse_utc(summary.get("recorded_at") if isinstance(summary, dict) else None)
+                if recorded_at is None or recorded_at >= cutoff:
+                    continue
+            try:
+                path.unlink()
+            except OSError:
+                skipped += 1
+            else:
+                removed += 1
+    emit({"removed": removed, "skipped": skipped})
+    return 0
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     metadata = refreshed_metadata(args.worker_id)
     if metadata.get("state") in ACTIVE_STATES:
@@ -1272,7 +1922,22 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     root = state_root()
     if directory.parent != root or directory == root:
         raise RunnerError("unsafe_cleanup_path", "refusing unsafe cleanup path", 5)
-    shutil.rmtree(directory)
+    if args.discard_history:
+        shutil.rmtree(directory)
+        discard_history(args.worker_id)
+    elif telemetry_enabled():
+        history = history_root()
+        with worker_lock(history):
+            summary = snapshot_history_locked(metadata)
+            if summary is None:
+                raise RunnerError(
+                    "history_snapshot_unavailable",
+                    "cannot preserve telemetry summary from terminal worker metadata",
+                    5,
+                )
+            shutil.rmtree(directory)
+    else:
+        shutil.rmtree(directory)
     emit({"worker_id": args.worker_id, "state": "cleaned"})
     return 0
 
@@ -1301,6 +1966,8 @@ def add_launch_options(parser: argparse.ArgumentParser) -> None:
         type=float,
         help="Optional per-worker wall-clock deadline; finite and greater than zero; never inherited",
     )
+    parser.add_argument("--task-class", choices=TASK_CLASSES, default="unknown")
+    parser.add_argument("--route-reason", choices=ROUTE_REASONS, default="unknown")
     parser.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"))
     parser.add_argument("--dangerously-bypass-approvals-and-sandbox", action="store_true")
 
@@ -1348,8 +2015,36 @@ def parser() -> argparse.ArgumentParser:
     cancel.add_argument("--timeout", type=float, default=5)
     cancel.set_defaults(func=cmd_cancel)
 
+    outcome = commands.add_parser(
+        "record-outcome",
+        help="Record controller-verified low-cardinality outcome labels",
+    )
+    outcome.add_argument("worker_id")
+    outcome.add_argument("--outcome", required=True, choices=CONTROLLER_OUTCOMES)
+    outcome.add_argument("--verification", required=True, choices=VERIFICATION_OUTCOMES)
+    outcome.add_argument("--reason-code", action="append", choices=OUTCOME_REASON_CODES)
+    outcome.add_argument("--task-class", choices=TASK_CLASSES)
+    outcome.add_argument("--route-reason", choices=ROUTE_REASONS)
+    outcome.set_defaults(func=cmd_record_outcome)
+
+    report = commands.add_parser("report", help="Aggregate privacy-minimized local worker summaries")
+    report.add_argument("--since-days", type=float, default=30)
+    report.add_argument("--agent", choices=AGENTS)
+    report.set_defaults(func=cmd_report)
+
+    purge = commands.add_parser("purge-history", help="Delete retained telemetry summaries")
+    purge_scope = purge.add_mutually_exclusive_group(required=True)
+    purge_scope.add_argument("--older-than-days", type=float)
+    purge_scope.add_argument("--all", action="store_true")
+    purge.set_defaults(func=cmd_purge_history)
+
     cleanup = commands.add_parser("cleanup", help="Remove one terminal worker's state directory")
     cleanup.add_argument("worker_id")
+    cleanup.add_argument(
+        "--discard-history",
+        action="store_true",
+        help="Delete raw worker state even when telemetry cannot be preserved",
+    )
     cleanup.set_defaults(func=cmd_cleanup)
 
     internal = commands.add_parser("_run", help=argparse.SUPPRESS)
@@ -1366,6 +2061,19 @@ def main() -> int:
             raise RunnerError("invalid_wait", "wait must be finite and non-negative")
         if hasattr(args, "timeout") and (not math.isfinite(args.timeout) or args.timeout < 0):
             raise RunnerError("invalid_timeout", "timeout must be finite and non-negative")
+        if hasattr(args, "since_days") and (
+            not math.isfinite(args.since_days) or args.since_days < 0
+        ):
+            raise RunnerError("invalid_since_days", "since-days must be finite and non-negative")
+        if (
+            hasattr(args, "older_than_days")
+            and args.older_than_days is not None
+            and (not math.isfinite(args.older_than_days) or args.older_than_days < 0)
+        ):
+            raise RunnerError(
+                "invalid_older_than_days",
+                "older-than-days must be finite and non-negative",
+            )
         if hasattr(args, "deadline_seconds") and args.deadline_seconds is not None and (
             not math.isfinite(args.deadline_seconds) or args.deadline_seconds <= 0
         ):

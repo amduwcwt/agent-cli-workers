@@ -230,6 +230,35 @@ class GrokWorkerTests(unittest.TestCase):
         self.assertIn("deadline_at", finished)
         self.assertIn("timed_out_at", finished)
 
+    def test_legacy_entry_forwards_telemetry_labels_and_reports_grok(self):
+        prompt = self.write_prompt("telemetry.md", "telemetry task")
+        proc, spawned = self.spawn(
+            prompt,
+            "--task-class",
+            "review",
+            "--route-reason",
+            "fast-readonly",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        outcome_proc, outcome = self.run_cli(
+            "record-outcome",
+            spawned["worker_id"],
+            "--outcome",
+            "accepted",
+            "--verification",
+            "passed",
+        )
+        self.assertEqual(outcome_proc.returncode, 0, outcome_proc.stderr)
+        self.assertEqual(outcome["task_class"], "review")
+
+        report_proc, report = self.run_cli("report", "--since-days", "30")
+        self.assertEqual(report_proc.returncode, 0, report_proc.stderr)
+        self.assertEqual(report["runs"], 1)
+        self.assertEqual(report["by_agent"], {"grok": 1})
+        self.assertEqual(report["by_outcome"], {"accepted": 1})
+
     def test_followup_resumes_native_session(self):
         first_prompt = self.write_prompt("first.md", "first task")
         proc, first = self.spawn(first_prompt)

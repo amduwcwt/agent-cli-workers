@@ -23,6 +23,7 @@ The runner provides:
 - native Grok session and Codex thread resume;
 - read-only sandbox defaults and explicit per-worker escalation;
 - private prompt files, process-group cancellation/deadlines, and owned state directories;
+- privacy-minimized derived run summaries, controller-recorded outcomes, local aggregate reports, and retention controls;
 - allowlisted Grok results that never emit the provider `thought` field;
 - `collect --capsule`, which normalizes the final six-line handoff and rejects invalid or oversized successful results;
 - workflow guidance for one writer per overlapping file set and caller-owned worktrees.
@@ -83,6 +84,8 @@ RUNNER="${CODEX_HOME:-$HOME/.codex}/skills/agent-cli-workers/scripts/agent_worke
 python3 "$RUNNER" spawn \
   --agent grok \
   --cwd /absolute/path/to/repository \
+  --task-class review \
+  --route-reason fast-readonly \
   --sandbox read-only \
   --prompt-file /absolute/path/to/task.md
 ```
@@ -106,6 +109,23 @@ Split long work into bounded deliverables. Add `--deadline-seconds <positive-sec
 
 Deadline termination is not a rollback. A write-capable worker can leave a partial diff, so retain and inspect its worktree before deciding whether to integrate or discard it. Process-group cancellation covers descendants that remain in the agent's group; a descendant that deliberately creates a new session/process group is outside that guarantee.
 
+## Local telemetry
+
+The runner writes one derived summary per terminal worker to a private history directory. Supply versioned low-cardinality labels with `--task-class` and `--route-reason`; after independent verification, record the controller's outcome:
+
+```bash
+python3 "$RUNNER" record-outcome <worker-id> \
+  --outcome accepted \
+  --verification passed
+
+python3 "$RUNNER" report --since-days 30
+python3 "$RUNNER" purge-history --older-than-days 90
+```
+
+Summaries retain lifecycle state, runner/skill version, fixed token fields, byte counts, capsule status, controller provenance, and allowlisted enum labels. They do not retain prompt or result text, thought, raw stderr, cwd, filenames, session ids, diffs, or arbitrary provider usage keys. No telemetry is uploaded.
+
+Set `AGENT_CLI_WORKERS_TELEMETRY=0` to disable new summaries or `AGENT_CLI_WORKERS_HISTORY_DIR` to choose another private root. Normal cleanup preserves the summary before deleting raw worker artifacts. `cleanup <worker-id> --discard-history` is the explicit escape hatch when history is unavailable or corrupt and raw sensitive artifacts must still be removed. Aggregate reports include sample and missing-feedback denominators; do not treat small samples or controller labels as proof that a routing rule is better.
+
 ## Model policy
 
 By default the runner does not pass a model to either CLI. This preserves each user's existing CLI configuration.
@@ -124,6 +144,8 @@ Worker state defaults to:
 ```text
 ${AGENT_CLI_WORKERS_STATE_DIR:-${CODEX_HOME:-~/.codex}/state/agent-cli-workers/workers}
 ```
+
+Derived telemetry history defaults to the sibling `history` directory and can be overridden with `AGENT_CLI_WORKERS_HISTORY_DIR`.
 
 The runner requires the state root to be an owned directory with mode `0700`. Worker artifacts use mode `0600`. Prompt bodies are removed after execution and are never stored in metadata or detached-wrapper arguments. Raw provider captures remain local until `cleanup`; inspect them deliberately and do not publish the state directory.
 

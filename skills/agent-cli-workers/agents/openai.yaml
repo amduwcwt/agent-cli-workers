@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent CLI Workers"
-  short_description: "Run resumable Grok or Codex CLI workers with compact handoffs"
-  default_prompt: "Use $agent-cli-workers to route this task to one primary Grok or Codex worker, continue useful local work, then collect with --capsule and independently verify the handoff."
+  short_description: "Run, verify, and learn from resumable CLI workers"
+  default_prompt: "Use $agent-cli-workers to route one worker, collect and independently verify its capsule, then record a privacy-minimized controller outcome."

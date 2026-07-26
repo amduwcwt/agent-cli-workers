@@ -74,6 +74,37 @@ class PublicTreeTests(unittest.TestCase):
             self.assertIn("do not `followup` that native session", text)
         self.assertNotIn("--max-turns 4", shared)
 
+    def test_worker_authorization_is_task_scoped_not_phrase_scoped(self):
+        shared = (ROOT / "skills" / "agent-cli-workers" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        grok = (ROOT / "skills" / "grok-build-cli" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        for text in (shared, grok):
+            self.assertIn(
+                "Derive authorization from the active task's requested outcome, target scope, "
+                "and operation class",
+                text,
+            )
+            self.assertIn(
+                "A continuation resumes the existing authorization envelope; it neither "
+                "creates nor expands authority.",
+                text,
+            )
+            self.assertIn("Compare each next action with the current envelope", text)
+            self.assertNotIn('"开干", "继续", "go", "同意", or "使用代理"', text)
+
+        self.assertIn(
+            "`workspace-write` as an execution profile within that envelope",
+            shared,
+        )
+        self.assertIn(
+            "Delegation changes who performs an action, not the action's authorization class.",
+            grok,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

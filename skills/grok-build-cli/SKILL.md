@@ -1,6 +1,6 @@
 ---
 name: grok-build-cli
-description: Call Grok Build CLI directly or through the shared durable asynchronous agent-cli-workers runner for research, review, coding, testing, native-session follow-up, and isolated work via caller-created git worktrees. Use when the user says “用 Grok”, “调用 Grok Build”, “让 Grok 做”, “Grok 作为 Codex 子 Agent”, asks Codex to keep working while Grok runs, requests a temporary Grok worktree, needs a Grok-specific direct call, or needs to diagnose Grok CLI/provider behavior. Existing grok_worker.py commands remain supported as a compatibility entry point; use agent-cli-workers for mixed Grok/Codex delegation and model selection.
+description: Call Grok Build CLI directly or through the durable agent-cli-workers runner for research, review, coding, testing, native-session follow-up, caller-owned worktrees, deadlines, and privacy-minimized local outcome telemetry. Use when the user asks to use Grok, keep working while Grok runs, isolate a Grok edit, diagnose Grok/provider behavior, or improve delegation from recorded run evidence. Existing grok_worker.py commands remain supported; use agent-cli-workers for mixed delegation and model selection.
 ---
 
 # Grok Build CLI
@@ -26,7 +26,15 @@ Do not wait serially for an async worker while useful local work remains. Inspec
 
 For mixed delegation, use `--agent codex` for the Codex worker. Model selection defaults to each installed CLI and can be configured through the shared runner.
 
-Use Grok as the primary worker for fast read-only investigation, bounded review, contract checking, and independent second opinions. Use Codex as the sole writer for implementation and test repair by default. Let Grok edit only when the user explicitly requests it, isolate that edit from every other writer, and never let Grok and Codex edit an overlapping file set.
+Use Grok as the primary worker for fast read-only investigation, bounded review, contract checking, and independent second opinions. Use Codex as the sole writer for implementation and test repair by default. If the active task constrains the writer to Grok, apply the same task-scoped authorization envelope to Grok, isolate the edit from every other writer, and never let Grok and Codex edit an overlapping file set.
+
+## Apply task-scoped authorization
+
+- Derive authorization from the active task's requested outcome, target scope, and operation class—not from trigger words or message phrasing. Treat a change/build/fix request as authority for ordinary reversible repository-local steps needed for that outcome; keep a review/explanation/diagnosis request read-only unless the requested outcome changes.
+- Track that authority as a task-scoped authorization envelope. A continuation resumes the existing authorization envelope; it neither creates nor expands authority. Derive a new envelope when the user replaces or materially changes the task.
+- Treat `workspace-write` as an execution profile within that envelope, not as a separate approval event. Select it only when the worker must perform repository-local writes already implied by the active task.
+- Delegation changes who performs an action, not the action's authorization class. Route an implementation envelope to the normal Codex writer unless the task constrains provider choice; never convert a read-only envelope into write authority merely because an agent is requested.
+- Compare each next action with the current envelope. Ask only when it adds a new target, operation class, external side-effect domain, dangerous bypass, destructive or irreversible behavior, or credential access. Reuse authority already present in the envelope until the action completes, the user revokes it, or the task is superseded.
 
 Require Grok to end with the same compact handoff used by the shared runner:
 
@@ -51,6 +59,8 @@ RUNNER="${CODEX_HOME:-$HOME/.codex}/skills/agent-cli-workers/scripts/agent_worke
 python3 "$RUNNER" spawn \
   --agent grok \
   --cwd <absolute-cwd> \
+  --task-class review \
+  --route-reason fast-readonly \
   --prompt-file <absolute-task-file>
 ```
 
@@ -60,7 +70,7 @@ The command returns immediately. Prefer `--prompt-file` or `--prompt-stdin`; `--
 ${AGENT_CLI_WORKERS_STATE_DIR:-${CODEX_HOME:-~/.codex}/state/agent-cli-workers/workers}
 ```
 
-The shared runner defaults Grok to `--sandbox read-only`. For an editing task, request `--sandbox workspace-write`. Add `--permission-mode bypassPermissions` only when the user separately authorizes non-interactive tool approval. Scope both choices to the requested task and exact CWD; neither authorizes unrelated or destructive operations.
+The shared runner defaults Grok to `--sandbox read-only`. Pass `--sandbox workspace-write` only when the active authorization envelope includes repository-local writes. Add `--permission-mode bypassPermissions` only when that envelope explicitly includes non-interactive approval bypass. Scope both choices to the requested task and exact CWD; neither authorizes unrelated or destructive operations.
 
 Omit `--max-turns` for multi-source research, repository-wide source scans, and other open-ended investigations. Use it only for a short, closed check that should finish in a few tool turns; never use `1`, because a reasoning event can consume the only turn.
 
@@ -106,6 +116,17 @@ python3 "$LEGACY_RUNNER" spawn \
 ```
 
 It injects `--agent grok`, filters legacy `list` output to Grok, maps `--grok-binary` to `--binary`, forwards `--deadline-seconds`, and gives an explicit `GROK_BUILD_CLI_STATE_DIR` precedence when mapping it to `AGENT_CLI_WORKERS_STATE_DIR`. Keep it for existing scripts; use the shared runner for new workflows.
+
+The compatibility entry also forwards task/route labels and controller outcomes; its `report` command automatically filters to Grok:
+
+```bash
+python3 "$LEGACY_RUNNER" record-outcome <worker-id> \
+  --outcome accepted \
+  --verification passed
+python3 "$LEGACY_RUNNER" report --since-days 30
+```
+
+The shared runner stores only derived, low-cardinality summaries in private local history. It never places prompt text, result text, provider thought, raw stderr, cwd, filenames, session ids, or arbitrary usage keys in telemetry. Record outcomes only after independent verification; use `purge-history` for retention and `cleanup --discard-history` only as the explicit raw-deletion escape hatch when history is unavailable or corrupt.
 
 ## Run a direct task
 

@@ -30,9 +30,16 @@ VALUE_OPTIONS = {
     "--permission-mode",
     "--prompt",
     "--prompt-file",
+    "--outcome",
+    "--verification",
+    "--reason-code",
+    "--route-reason",
     "--sandbox",
+    "--since-days",
+    "--task-class",
     "--timeout",
     "--wait",
+    "--older-than-days",
 }
 
 
@@ -56,7 +63,7 @@ def mapped_args(argv: list[str]) -> list[str]:
         else:
             mapped.append(value)
         index += 1
-    if mapped[0] in {"spawn", "list"}:
+    if mapped[0] in {"spawn", "list", "report"}:
         mapped[1:1] = ["--agent", "grok"]
     return mapped
 

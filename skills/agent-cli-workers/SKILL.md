@@ -1,6 +1,6 @@
 ---
 name: agent-cli-workers
-description: Unified durable async worker workflow for Grok CLI and Codex CLI. Routes fast read-only investigation and review to Grok, routes implementation to Codex, enforces one-writer isolation and bounded completion capsules, and supports collection, native-session resume, status, cancellation, and cleanup. Use when Codex needs a lightweight headless worker instead of a daemon, TUI, or fleet orchestrator.
+description: Unified durable async worker workflow for Grok CLI and Codex CLI. Routes read-only investigation and review to Grok, routes implementation to Codex, enforces one-writer isolation and compact completion capsules, and supports resume, deadlines, privacy-minimized local run summaries, controller outcomes, aggregate reporting, cancellation, and cleanup. Use for lightweight headless delegation and evidence-based workflow improvement without a daemon or fleet orchestrator.
 ---
 
 # Agent CLI Workers (Grok + Codex)
@@ -27,6 +27,7 @@ State directory:
 - Keep main turn free for continued work.
 - Resume native session later (`followup`) using same context.
 - Collect output, inspect lifecycle state, and cleanup deterministically.
+- Retain privacy-minimized run summaries after raw worker cleanup and aggregate verified outcomes by low-cardinality task and route labels.
 
 ## Route the task
 
@@ -44,6 +45,13 @@ Use both adapters only when tasks are independent or in a deliberate writer-revi
 - Grok reviews read-only after the writer is terminal or at a fixed commit.
 - Two workers may receive the same contract only for an intentional read-only comparison.
 - The main session owns task decomposition, shared foundations, final diff review, verification, and integration.
+
+## Apply task-scoped authorization
+
+- Derive authorization from the active task's requested outcome, target scope, and operation class—not from trigger words or message phrasing. Treat a change/build/fix request as authority for ordinary reversible repository-local steps needed for that outcome; keep a review/explanation/diagnosis request read-only unless the requested outcome changes.
+- Track that authority as a task-scoped authorization envelope. A continuation resumes the existing authorization envelope; it neither creates nor expands authority. Derive a new envelope when the user replaces or materially changes the task.
+- Treat `workspace-write` as an execution profile within that envelope, not as a separate approval event. Select it when the chosen worker must perform repository-local writes already implied by the active task.
+- Compare each next action with the current envelope. Ask only when it adds a new target, operation class, external side-effect domain, dangerous bypass, destructive or irreversible behavior, or credential access. Reuse authority already present in the envelope until the action completes, the user revokes it, or the task is superseded.
 
 ## Turn caps and long tasks
 
@@ -104,6 +112,8 @@ PROMPT=/absolute/path/to/task.md
 python3 "$RUNNER" spawn \
   --agent grok \
   --cwd "$WORKDIR" \
+  --task-class review \
+  --route-reason fast-readonly \
   --sandbox read-only \
   --deadline-seconds 900 \
   --prompt-file "$PROMPT"
@@ -112,6 +122,8 @@ python3 "$RUNNER" spawn \
 python3 "$RUNNER" spawn \
   --agent codex \
   --cwd "$WORKDIR" \
+  --task-class implementation \
+  --route-reason default-writer \
   --sandbox workspace-write \
   --prompt-file "$PROMPT"
 ```
@@ -133,7 +145,7 @@ python3 "$RUNNER" spawn \
 - Set `AGENT_CLI_WORKERS_CODEX_MODEL` to define a deployment-wide Codex default without editing the skill.
 - Set comma-separated `AGENT_CLI_WORKERS_DISABLED_MODEL_PREFIXES` to reject local model families before worker creation and again before execution.
 - An explicit `--model` overrides `AGENT_CLI_WORKERS_CODEX_MODEL` unless the model matches a disabled prefix.
-- Both adapters default to the `read-only` sandbox. Request `workspace-write` explicitly for an editing worker.
+- Both adapters default to the `read-only` sandbox. Pass `workspace-write` only when the active authorization envelope includes repository-local writes.
 - Treat `danger-full-access`, Grok `bypassPermissions`, and Codex `--dangerously-bypass-approvals-and-sandbox` as per-worker authorization, never a reusable session default.
 - For Grok, omit `--model` by default so the configured provider/model remains authoritative.
 
@@ -190,6 +202,37 @@ Only one active worker may resume a native session at a time. Wait for or cancel
 For Grok, an explicit `stopReason` other than `EndTurn` is a terminal failure even when the CLI exits `0`; `collect` still returns the structured partial result for diagnosis.
 
 Use the exact repository or worktree path with `list --cwd` before deciding whether the current task already has a worker. Worker state is global; an unfiltered `list` can contain unrelated repositories such as Invite and must not be treated as coverage for the current repository.
+
+## Record outcomes and inspect telemetry
+
+Pass allowlisted controller labels at launch; use `unknown` when the controller cannot classify a run without inference:
+
+```bash
+python3 "$RUNNER" spawn \
+  --agent grok \
+  --cwd "$WORKDIR" \
+  --task-class review \
+  --route-reason independent-review \
+  --sandbox read-only \
+  --prompt-file "$PROMPT"
+```
+
+After independently checking workspace proof, diffs, and requested verification, record the controller's judgment. Never let a provider grade itself:
+
+```bash
+python3 "$RUNNER" record-outcome <worker-id> \
+  --outcome accepted \
+  --verification passed
+
+python3 "$RUNNER" report --since-days 30
+python3 "$RUNNER" purge-history --older-than-days 90
+```
+
+Use only the versioned CLI enums for task class, route reason, outcome, verification, and optional `--reason-code`; do not encode free-form prompt or transcript text into labels. `report` exposes fixed low-cardinality aggregates with explicit run and missing-feedback denominators. Treat small samples as observations, not routing proof.
+
+Telemetry is local and enabled by default. Set `AGENT_CLI_WORKERS_TELEMETRY=0` to disable new summaries. Override the private history location with `AGENT_CLI_WORKERS_HISTORY_DIR`; otherwise it is a sibling of the worker state directory. The runner validates owned/non-symlinked `0700` history storage and writes atomic `0600` summaries.
+
+Terminal workers write a derived summary before raw cleanup. Summaries contain lifecycle, fixed token fields, byte counts, capsule status, task/route enums, and controller provenance. They exclude prompt and result text, provider thought, raw stderr, cwd, filenames, session ids, diffs, and arbitrary provider usage keys. Normal `cleanup` preserves or repairs the summary; if telemetry is broken and sensitive raw artifacts must still be deleted, use the explicit escape hatch `cleanup <worker-id> --discard-history`.
 
 ## Recommended usage pattern for hardening workflows
 

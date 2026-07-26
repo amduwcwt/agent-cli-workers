@@ -68,6 +68,13 @@ payload = {
     "usage": {"input_tokens": 10, "output_tokens": 5},
     "modelUsage": {"grok": {"input_tokens": 10, "output_tokens": 5}},
 }
+if "USAGE_CANARY" in prompt:
+    payload["usage"].update({
+        "secret_label": "USAGE_PRIVATE_CANARY",
+        "negative_tokens": -7,
+        "fractional_tokens": 1.5,
+        "nested": {"provider_secret_key": 99},
+    })
 print(json.dumps(payload))
 '''
 
@@ -116,12 +123,14 @@ class AgentWorkerTests(unittest.TestCase):
         self.write_executable("codex", FAKE_CODEX)
         self.state_dir = self.root / "state"
         self.state_dir.mkdir(mode=0o700)
+        self.history_dir = self.root / "history"
         self.work_dir = self.root / "work"
         self.work_dir.mkdir()
         self.log_path = self.root / "agents.log"
         self.env = os.environ.copy()
         self.env["PATH"] = str(self.bin_dir) + os.pathsep + self.env.get("PATH", "")
         self.env["AGENT_CLI_WORKERS_STATE_DIR"] = str(self.state_dir)
+        self.env["AGENT_CLI_WORKERS_HISTORY_DIR"] = str(self.history_dir)
         self.env["FAKE_AGENT_LOG"] = str(self.log_path)
 
     def tearDown(self):
@@ -187,6 +196,12 @@ class AgentWorkerTests(unittest.TestCase):
         if not self.log_path.exists():
             return []
         return [json.loads(line) for line in self.log_path.read_text().splitlines()]
+
+    def history_path(self, worker_id):
+        return self.history_dir / f"{worker_id}.json"
+
+    def read_history(self, worker_id):
+        return json.loads(self.history_path(worker_id).read_text(encoding="utf-8"))
 
     @staticmethod
     def process_is_alive(pid):
@@ -765,6 +780,447 @@ class AgentWorkerTests(unittest.TestCase):
         cleanup_proc, cleaned = self.run_cli("cleanup", worker_id)
         self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
         self.assertEqual(cleaned["state"], "cleaned")
+
+    def test_telemetry_summary_outcome_report_and_cleanup_are_private(self):
+        canary = "SECRET_TELEMETRY_CANARY"
+        prompt = self.write_prompt(
+            "telemetry.md",
+            f"{canary}\nUSAGE_CANARY\nRETURN_CAPSULE",
+        )
+        proc, spawned = self.spawn(
+            "grok",
+            prompt,
+            "--task-class",
+            "review",
+            "--route-reason",
+            "fast-readonly",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        history_path = self.history_path(spawned["worker_id"])
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not history_path.exists():
+            time.sleep(0.02)
+        self.assertTrue(history_path.exists())
+        self.assertEqual(stat.S_IMODE(self.history_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(history_path.stat().st_mode), 0o600)
+
+        summary = self.read_history(spawned["worker_id"])
+        self.assertEqual(summary["task_class"], "review")
+        self.assertEqual(summary["route_reason"], "fast-readonly")
+        self.assertEqual(summary["capsule"]["status"], "valid")
+        self.assertGreater(summary["capsule"]["bytes"], 0)
+        self.assertEqual(summary["usage"]["input_tokens"], 10)
+        self.assertEqual(summary["usage"]["output_tokens"], 5)
+        self.assertEqual(set(summary["usage"]), {"input_tokens", "output_tokens"})
+        self.assertGreaterEqual(summary["duration_seconds"], 0)
+        self.assertRegex(summary["skill_sha256"], r"^[0-9a-f]{64}$")
+        serialized = json.dumps(summary)
+        for forbidden in (
+            canary,
+            str(self.work_dir),
+            "grok-session-001",
+            "PRIVATE_GROK_THOUGHT_MUST_NOT_LEAK",
+            "USAGE_PRIVATE_CANARY",
+            "provider_secret_key",
+            "prompt_sha256",
+            "session_id",
+            "result_path",
+            "stderr_path",
+            '"cwd"',
+            '"text"',
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+        outcome_proc, outcome = self.run_cli(
+            "record-outcome",
+            spawned["worker_id"],
+            "--outcome",
+            "accepted",
+            "--verification",
+            "passed",
+        )
+        self.assertEqual(outcome_proc.returncode, 0, outcome_proc.stderr)
+        self.assertEqual(outcome["controller"]["outcome"], "accepted")
+        self.assertEqual(outcome["controller"]["verification"], "passed")
+        self.assertEqual(outcome["controller"]["provenance"], "controller")
+
+        report_proc, report = self.run_cli("report", "--since-days", "30")
+        self.assertEqual(report_proc.returncode, 0, report_proc.stderr)
+        self.assertEqual(report["runs"], 1)
+        self.assertEqual(report["root_runs"], 1)
+        self.assertEqual(report["followup_runs"], 0)
+        self.assertEqual(report["by_agent"], {"grok": 1})
+        self.assertEqual(report["by_outcome"], {"accepted": 1})
+        self.assertEqual(report["by_verification"], {"passed": 1})
+        self.assertEqual(report["feedback"]["recorded"], 1)
+        self.assertEqual(report["feedback"]["missing"], 0)
+        self.assertEqual(report["corrupt_summaries"], 0)
+        self.assertEqual(report["usage_totals"]["input_tokens"], 10)
+        self.assertNotIn(canary, json.dumps(report))
+
+        cleanup_proc, cleaned = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+        self.assertEqual(cleaned["state"], "cleaned")
+        self.assertFalse((self.state_dir / spawned["worker_id"]).exists())
+        self.assertTrue(history_path.exists())
+
+    def test_telemetry_records_invalid_capsule_failure_and_missing_usage(self):
+        prompt = self.write_prompt("invalid-telemetry.md", "no capsule")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+        summary = self.read_history(spawned["worker_id"])
+        self.assertEqual(summary["capsule"], {"status": "invalid", "bytes": 0})
+
+        directory, metadata = self.seed_worker("missing-usage", state="failed")
+        metadata.update(
+            runner_version="legacy",
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            exit_code=7,
+        )
+        (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        cleanup_proc, _ = self.run_cli("cleanup", "missing-usage")
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+        summary = self.read_history("missing-usage")
+        self.assertEqual(summary["failure_class"], "exit_nonzero")
+        self.assertIsNone(summary["usage"])
+        self.assertEqual(summary["capsule"], {"status": "missing", "bytes": 0})
+
+        directory, metadata = self.seed_worker("stderr-max-turns", state="failed")
+        metadata.update(
+            runner_version="legacy",
+            finished_at="2026-01-01T00:00:01Z",
+            exit_code=1,
+        )
+        (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (directory / "stderr.log").write_text(
+            "provider stopped after maximum turns reached", encoding="utf-8"
+        )
+        cleanup_proc, _ = self.run_cli("cleanup", "stderr-max-turns")
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+        self.assertEqual(self.read_history("stderr-max-turns")["failure_class"], "max_turns")
+
+    def test_telemetry_corruption_blocks_cleanup_unless_discarded(self):
+        prompt = self.write_prompt("corrupt-history.md", "corrupt history")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+        self.history_path(spawned["worker_id"]).write_text("{broken", encoding="utf-8")
+
+        outcome_proc, outcome = self.run_cli(
+            "record-outcome",
+            spawned["worker_id"],
+            "--outcome",
+            "rejected",
+            "--verification",
+            "failed",
+        )
+        self.assertEqual(outcome_proc.returncode, 5)
+        self.assertEqual(outcome["error"], "history_corrupt")
+
+        report_proc, report = self.run_cli("report")
+        self.assertEqual(report_proc.returncode, 0, report_proc.stderr)
+        self.assertEqual(report["runs"], 0)
+        self.assertEqual(report["corrupt_summaries"], 1)
+
+        cleanup_proc, cleanup = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 5)
+        self.assertEqual(cleanup["error"], "history_corrupt")
+        self.assertTrue((self.state_dir / spawned["worker_id"]).exists())
+
+        cleanup_proc, cleaned = self.run_cli(
+            "cleanup",
+            spawned["worker_id"],
+            "--discard-history",
+        )
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+        self.assertEqual(cleaned["state"], "cleaned")
+        self.assertFalse((self.state_dir / spawned["worker_id"]).exists())
+        self.assertFalse(self.history_path(spawned["worker_id"]).exists())
+
+    def test_report_normalizes_tampered_labels_without_echoing_them(self):
+        prompt = self.write_prompt("tampered-report.md", "tampered report")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        summary = self.read_history(spawned["worker_id"])
+        canary = "REPORT_PRIVATE_CANARY"
+        summary.update(
+            agent=f"{canary}_AGENT",
+            task_class=f"{canary}_TASK",
+            route_reason=f"{canary}_ROUTE",
+            state=f"{canary}_STATE",
+            failure_class=f"{canary}_FAILURE",
+            controller={
+                "provenance": "controller",
+                "outcome": f"{canary}_OUTCOME",
+                "verification": f"{canary}_VERIFY",
+                "reason_codes": [f"{canary}_REASON"],
+            },
+        )
+        self.history_path(spawned["worker_id"]).write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+
+        report_proc, report = self.run_cli("report")
+
+        self.assertEqual(report_proc.returncode, 0, report_proc.stderr)
+        self.assertNotIn(canary, json.dumps(report))
+        for dimension in (
+            "by_agent",
+            "by_task_class",
+            "by_route_reason",
+            "by_state",
+            "by_failure_class",
+            "by_outcome",
+            "by_verification",
+            "by_reason_code",
+        ):
+            self.assertEqual(report[dimension], {"unknown": 1})
+
+    def test_controller_label_corrections_survive_cleanup_snapshot(self):
+        prompt = self.write_prompt("correct-labels.md", "correct labels")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        outcome_proc, _ = self.run_cli(
+            "record-outcome",
+            spawned["worker_id"],
+            "--outcome",
+            "accepted",
+            "--verification",
+            "passed",
+            "--task-class",
+            "review",
+            "--route-reason",
+            "independent-review",
+        )
+        self.assertEqual(outcome_proc.returncode, 0, outcome_proc.stderr)
+        cleanup_proc, _ = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+
+        summary = self.read_history(spawned["worker_id"])
+        self.assertEqual(summary["task_class"], "review")
+        self.assertEqual(summary["route_reason"], "independent-review")
+
+    def test_record_outcome_drops_unknown_history_fields_without_echoing_them(self):
+        prompt = self.write_prompt("outcome-canary.md", "outcome canary")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        canary = "OUTCOME_PRIVATE_CANARY"
+        summary = self.read_history(spawned["worker_id"])
+        summary.update(
+            prompt=canary,
+            cwd=f"/{canary}",
+            session_id=canary,
+            raw_stderr=canary,
+            unknown_nested={"secret": canary},
+        )
+        summary["artifacts"]["unknown_bytes"] = canary
+        summary["capsule"]["unknown_status"] = canary
+        summary["usage"]["unknown_tokens"] = canary
+        self.history_path(spawned["worker_id"]).write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+
+        outcome_proc, outcome = self.run_cli(
+            "record-outcome",
+            spawned["worker_id"],
+            "--outcome",
+            "accepted",
+            "--verification",
+            "passed",
+        )
+
+        self.assertEqual(outcome_proc.returncode, 0, outcome_proc.stderr)
+        self.assertNotIn(canary, json.dumps(outcome))
+        self.assertNotIn(canary, json.dumps(self.read_history(spawned["worker_id"])))
+
+    def test_stale_snapshot_after_cleanup_preserves_derived_metrics(self):
+        prompt = self.write_prompt("stale-snapshot.md", "RETURN_CAPSULE")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+        metadata = json.loads(
+            (self.state_dir / spawned["worker_id"] / "metadata.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        before = self.read_history(spawned["worker_id"])
+        cleanup_proc, _ = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_CLI_WORKERS_STATE_DIR": str(self.state_dir),
+                "AGENT_CLI_WORKERS_HISTORY_DIR": str(self.history_dir),
+            },
+        ):
+            RUNNER_API["snapshot_history"](metadata)
+
+        after = self.read_history(spawned["worker_id"])
+        for field in ("usage", "capsule", "artifacts", "duration_seconds"):
+            self.assertEqual(after[field], before[field])
+
+    def test_cleanup_requires_summary_when_terminal_metadata_lacks_result_path(self):
+        directory, metadata = self.seed_worker("missing-result-path", state="failed")
+        metadata.pop("result_path")
+        (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+        cleanup_proc, cleanup = self.run_cli("cleanup", "missing-result-path")
+
+        self.assertEqual(cleanup_proc.returncode, 5)
+        self.assertEqual(cleanup["error"], "history_snapshot_unavailable")
+        self.assertTrue(directory.exists())
+
+        discard_proc, _ = self.run_cli(
+            "cleanup", "missing-result-path", "--discard-history"
+        )
+        self.assertEqual(discard_proc.returncode, 0, discard_proc.stderr)
+        self.assertFalse(directory.exists())
+
+    def test_successful_worker_ignores_recovered_provider_error_stderr(self):
+        directory, metadata = self.seed_worker("recovered-provider-error", state="succeeded")
+        metadata.update(finished_at="2026-01-01T00:00:01Z", exit_code=0)
+        (directory / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (directory / "stderr.log").write_text(
+            "retry recovered after HTTP status 429", encoding="utf-8"
+        )
+
+        cleanup_proc, _ = self.run_cli("cleanup", "recovered-provider-error")
+
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+        self.assertEqual(
+            self.read_history("recovered-provider-error")["failure_class"], "none"
+        )
+
+    def test_telemetry_unsafe_history_root_preserves_raw_until_escape_hatch(self):
+        victim = self.root / "history-victim"
+        victim.mkdir(mode=0o700)
+        self.history_dir.symlink_to(victim, target_is_directory=True)
+        prompt = self.write_prompt("unsafe-history.md", "unsafe history")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        cleanup_proc, cleanup = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 5)
+        self.assertEqual(cleanup["error"], "unsafe_history_dir")
+        self.assertTrue((self.state_dir / spawned["worker_id"]).exists())
+
+        cleanup_proc, cleaned = self.run_cli(
+            "cleanup",
+            spawned["worker_id"],
+            "--discard-history",
+        )
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+        self.assertEqual(cleaned["state"], "cleaned")
+        self.assertFalse((self.state_dir / spawned["worker_id"]).exists())
+
+    def test_existing_insecure_history_root_is_rejected_without_chmod(self):
+        self.history_dir.mkdir(mode=0o755)
+        self.history_dir.chmod(0o755)
+        prompt = self.write_prompt("insecure-history.md", "insecure history")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        cleanup_proc, cleanup = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 5)
+        self.assertEqual(cleanup["error"], "insecure_history_dir")
+        self.assertEqual(stat.S_IMODE(self.history_dir.stat().st_mode), 0o755)
+        self.assertTrue((self.state_dir / spawned["worker_id"]).exists())
+
+        cleanup_proc, _ = self.run_cli(
+            "cleanup",
+            spawned["worker_id"],
+            "--discard-history",
+        )
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+
+    def test_history_root_cannot_be_an_ancestor_of_worker_state(self):
+        self.env["AGENT_CLI_WORKERS_HISTORY_DIR"] = str(self.root)
+
+        report_proc, report = self.run_cli("report")
+
+        self.assertEqual(report_proc.returncode, 5)
+        self.assertEqual(report["error"], "unsafe_history_dir")
+
+    def test_telemetry_can_be_disabled_and_history_can_be_purged(self):
+        self.env["AGENT_CLI_WORKERS_TELEMETRY"] = "0"
+        prompt = self.write_prompt("disabled-telemetry.md", "disabled telemetry")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+        self.assertFalse(self.history_dir.exists())
+        cleanup_proc, _ = self.run_cli("cleanup", spawned["worker_id"])
+        self.assertEqual(cleanup_proc.returncode, 0, cleanup_proc.stderr)
+
+        self.env.pop("AGENT_CLI_WORKERS_TELEMETRY")
+        prompt = self.write_prompt("purge-telemetry.md", "purge telemetry")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+        summary = self.read_history(spawned["worker_id"])
+        summary["recorded_at"] = "2000-01-01T00:00:00Z"
+        self.history_path(spawned["worker_id"]).write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+        purge_proc, purged = self.run_cli(
+            "purge-history",
+            "--older-than-days",
+            "30",
+        )
+        self.assertEqual(purge_proc.returncode, 0, purge_proc.stderr)
+        self.assertEqual(purged["removed"], 1)
+        self.assertFalse(self.history_path(spawned["worker_id"]).exists())
+
+    def test_outcome_and_cleanup_are_serialized_without_lost_update(self):
+        prompt = self.write_prompt("concurrent-history.md", "concurrent history")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        outcome = subprocess.Popen(
+            [
+                sys.executable,
+                str(RUNNER),
+                "record-outcome",
+                spawned["worker_id"],
+                "--outcome",
+                "accepted",
+                "--verification",
+                "passed",
+                "--reason-code",
+                "none",
+            ],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        cleanup = subprocess.Popen(
+            [sys.executable, str(RUNNER), "cleanup", spawned["worker_id"]],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        outcome_stdout, outcome_stderr = outcome.communicate(timeout=5)
+        cleanup_stdout, cleanup_stderr = cleanup.communicate(timeout=5)
+        self.assertEqual(outcome.returncode, 0, (outcome_stdout, outcome_stderr))
+        self.assertEqual(cleanup.returncode, 0, (cleanup_stdout, cleanup_stderr))
+        summary = self.read_history(spawned["worker_id"])
+        self.assertEqual(summary["controller"]["outcome"], "accepted")
+        self.assertEqual(summary["controller"]["reason_codes"], ["none"])
 
     def test_deadline_terminates_agent_group_and_blocks_followup(self):
         child_pid_path = self.root / "deadline-child.pid"

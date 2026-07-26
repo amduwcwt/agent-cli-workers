@@ -1,4 +1,4 @@
 interface:
   display_name: "Grok Build CLI"
-  short_description: "Run and resume bounded Grok CLI workers from Codex"
-  default_prompt: "Use $grok-build-cli to run this bounded Grok task directly or asynchronously, require workspace proof, collect with --capsule, then independently verify the result."
+  short_description: "Run, verify, and learn from bounded Grok workers"
+  default_prompt: "Use $grok-build-cli to run this bounded Grok task, verify its capsule independently, then record a privacy-minimized controller outcome."
