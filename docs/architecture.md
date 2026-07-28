@@ -35,6 +35,12 @@ Only one active descendant may resume a native session at a time.
 6. Telemetry is derived persistence, not a transcript archive. The sibling history root receives one atomic `0600` JSON summary per worker under an owned, non-symlinked `0700` directory. It excludes prompt/result text, thought, raw stderr, cwd, filenames, session ids, diffs, and arbitrary provider keys.
 7. Task class, route reason, outcome, verification, and reason codes are controller-submitted allowlisted labels with explicit provenance. They are not inferred from prompts and are not provider self-evaluation.
 
+## Controller observation boundary
+
+`controller_observation.py` is an optional prospective measurement tool, not part of the worker lifecycle. It records a routing prediction and request timestamp before execution, then records the actual route and verification timestamp after the controller finishes checking the result. Direct work and delegated work use the same observation schema, so end-to-end P50/P90 comparisons do not exclude the direct path.
+
+The observation tool does not spawn or resume workers, create worktrees, inspect prompts, grade providers, or mutate worker history. Its records use opaque IDs, fixed enums, timestamps, numeric predictions, and rework counts under a separate private state directory. The core runner does not import it.
+
 ## Telemetry lifecycle
 
 The terminal wrapper creates or refreshes the derived summary. `cleanup` verifies or repairs it before deleting raw worker state; `--discard-history` is the explicit escape hatch when telemetry is broken and raw sensitive artifacts must still be removed. Outcome updates and cleanup serialize through the history lock, while atomic replacement prevents partial summaries.

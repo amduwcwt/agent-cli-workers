@@ -105,6 +105,22 @@ class PublicTreeTests(unittest.TestCase):
             grok,
         )
 
+    def test_controller_observation_remains_outside_worker_runtime(self):
+        runner = (
+            ROOT / "skills" / "agent-cli-workers" / "scripts" / "agent_worker.py"
+        ).read_text(encoding="utf-8")
+        observer = (
+            ROOT
+            / "skills"
+            / "agent-cli-workers"
+            / "scripts"
+            / "controller_observation.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("controller_observation", runner)
+        self.assertNotIn("agent_worker", observer)
+        self.assertNotIn("subprocess", observer)
+
 
 if __name__ == "__main__":
     unittest.main()

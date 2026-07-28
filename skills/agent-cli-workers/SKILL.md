@@ -235,6 +235,30 @@ Telemetry is local and enabled by default. Set `AGENT_CLI_WORKERS_TELEMETRY=0` t
 
 Terminal workers write a derived summary before raw cleanup. Summaries contain lifecycle, fixed token fields, byte counts, capsule status, task/route enums, and controller provenance. They exclude prompt and result text, provider thought, raw stderr, cwd, filenames, session ids, diffs, and arbitrary provider usage keys. Normal `cleanup` preserves or repairs the summary; if telemetry is broken and sensitive raw artifacts must still be deleted, use the explicit escape hatch `cleanup <worker-id> --discard-history`.
 
+## Observe routing decisions
+
+Worker telemetry does not measure controller routing, waiting, review, or verification. For a prospective routing study, use the separate observation tool before execution and after controller verification:
+
+```bash
+OBSERVER="${CODEX_HOME:-$HOME/.codex}/skills/agent-cli-workers/scripts/controller_observation.py"
+
+python3 "$OBSERVER" begin \
+  --task-class review \
+  --predicted-route grok \
+  --predicted-direct-seconds 120 \
+  --wait-mode parallel \
+  --parallel-work-class implementation
+
+python3 "$OBSERVER" finish <decision-id> \
+  --actual-route grok \
+  --verification passed \
+  --rework-count 0
+
+python3 "$OBSERVER" report --since-days 30
+```
+
+Call `begin` before direct work or worker launch. Use `--predicted-route direct --wait-mode none` for direct work. Parallel delegation must name an allowlisted parallel work class; blocking delegation cannot claim parallel work. Call `finish` only after independent verification. The tool stores no prompt, transcript, CWD, filename, diff, or session id. Its private database defaults under `${CODEX_HOME:-~/.codex}/state/agent-cli-workers/observations`; `AGENT_CLI_WORKERS_OBSERVATION_DIR` overrides it. The tool does not import into or add commands to the worker runner. Treat P50/P90 and prediction/rework rates as observations, not counterfactual proof.
+
 ## Recommended usage pattern for hardening workflows
 
 1. For code work, require the worker to run and report `pwd`, `git rev-parse --show-toplevel`, and `git rev-parse HEAD` before inspecting or editing files.

@@ -128,6 +128,30 @@ Summaries retain lifecycle state, runner/skill version, fixed token fields, byte
 
 Set `AGENT_CLI_WORKERS_TELEMETRY=0` to disable new summaries or `AGENT_CLI_WORKERS_HISTORY_DIR` to choose another private root. Normal cleanup preserves the summary before deleting raw worker artifacts. `cleanup <worker-id> --discard-history` is the explicit escape hatch when history is unavailable or corrupt and raw sensitive artifacts must still be removed. Aggregate reports include sample and missing-feedback denominators; do not treat small samples or controller labels as proof that a routing rule is better.
 
+## Controller routing observations
+
+Worker duration does not include controller routing, waiting, review, or verification. The optional controller observation tool measures that end-to-end interval without changing the worker lifecycle or history schema:
+
+```bash
+OBSERVER="${CODEX_HOME:-$HOME/.codex}/skills/agent-cli-workers/scripts/controller_observation.py"
+
+python3 "$OBSERVER" begin \
+  --task-class review \
+  --predicted-route grok \
+  --predicted-direct-seconds 120 \
+  --wait-mode parallel \
+  --parallel-work-class implementation
+
+python3 "$OBSERVER" finish <decision-id> \
+  --actual-route grok \
+  --verification passed \
+  --rework-count 0
+
+python3 "$OBSERVER" report --since-days 30
+```
+
+Call `begin` before direct work or worker launch and `finish` only after controller verification. A direct prediction uses `--wait-mode none`. Parallel delegation must name one allowlisted parallel work class; blocking delegation cannot claim parallel work. Records contain only opaque IDs, timestamps, enums, numeric predictions, and counts. They exclude prompts, transcripts, CWDs, filenames, diffs, and session IDs. The private database defaults to `${CODEX_HOME:-~/.codex}/state/agent-cli-workers/observations` and can be relocated with `AGENT_CLI_WORKERS_OBSERVATION_DIR`. Reports expose P50/P90 end-to-end duration rather than an average. This is prospective observation, not proof of a counterfactual direct runtime.
+
 ## Model policy
 
 By default the runner does not pass a model to either CLI. This preserves each user's existing CLI configuration.
@@ -158,6 +182,7 @@ See [docs/architecture.md](docs/architecture.md) for lifecycle and trust boundar
 ```bash
 python3 skills/agent-cli-workers/tests/test_agent_worker.py
 python3 skills/grok-build-cli/tests/test_grok_worker.py
+python3 tests/test_controller_observation.py
 python3 tests/test_public_tree.py
 ```
 

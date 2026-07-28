@@ -24,5 +24,7 @@ jobs:
         run: python3 skills/agent-cli-workers/tests/test_agent_worker.py
       - name: Test Grok compatibility entry point
         run: python3 skills/grok-build-cli/tests/test_grok_worker.py
+      - name: Test controller observations
+        run: python3 tests/test_controller_observation.py
       - name: Check public tree
         run: python3 tests/test_public_tree.py
