@@ -36,7 +36,7 @@ Use Grok as the primary worker for fast read-only investigation, bounded review,
 - Delegation changes who performs an action, not the action's authorization class. Route an implementation envelope to the normal Codex writer unless the task constrains provider choice; never convert a read-only envelope into write authority merely because an agent is requested.
 - Compare each next action with the current envelope. Ask only when it adds a new target, operation class, external side-effect domain, dangerous bypass, destructive or irreversible behavior, or credential access. Reuse authority already present in the envelope until the action completes, the user revokes it, or the task is superseded.
 
-Require Grok to end with the same compact handoff used by the shared runner:
+Require Grok to end with the same compact handoff used by the shared runner. Root async Grok prompts receive this contract automatically; use `--no-capsule-contract` only for an intentional alternative output shape:
 
 ```text
 STATUS: succeeded|blocked|failed
@@ -87,7 +87,7 @@ python3 "$RUNNER" collect <worker-id> --capsule --wait 30
 python3 "$RUNNER" collect <worker-id>
 ```
 
-Capsule collection exits `0` for success, `1` for a terminal failure/cancellation, `3` while active, and `4` when a successful worker omitted a valid capsule. Avoid a blocking wait longer than 60 seconds. The compact result excludes Grok `thought` and token-usage payloads. Use ordinary `collect` only for failure diagnosis; it still allowlists Grok's result fields and never emits `thought`. Independently inspect delegated code changes and run focused verification.
+Capsule collection exits `0` for success, `1` for a terminal failure/cancellation, `3` while active, and `4` when a successful worker omitted a valid capsule. Plain and Markdown-bold field labels are normalized. Avoid a blocking wait longer than 60 seconds. The compact result excludes Grok `thought` and token-usage payloads. Use ordinary `collect` only for failure diagnosis; it still allowlists Grok's result fields and never emits `thought`. Independently inspect delegated code changes and run focused verification.
 
 ### Continue, cancel, and clean
 

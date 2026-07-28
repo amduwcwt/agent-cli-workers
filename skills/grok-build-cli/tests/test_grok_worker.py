@@ -26,6 +26,7 @@ import time
 args = sys.argv[1:]
 prompt_path = Path(args[args.index("--prompt-file") + 1])
 prompt = prompt_path.read_text(encoding="utf-8")
+task_prompt = prompt.split("\n\n--- agent-cli-workers completion contract ---", 1)[0].rstrip()
 resume = args[args.index("--resume") + 1] if "--resume" in args else None
 log_path = os.environ.get("FAKE_GROK_LOG")
 if log_path:
@@ -37,7 +38,7 @@ for line in prompt.splitlines():
         time.sleep(float(line.split("=", 1)[1]))
 
 payload = {
-    "text": "fake result: " + prompt.splitlines()[-1],
+    "text": "fake result: " + task_prompt.splitlines()[-1],
     "thought": "PRIVATE_GROK_THOUGHT_MUST_NOT_LEAK",
     "stopReason": "EndTurn",
     "sessionId": resume or "sess-fake-001",

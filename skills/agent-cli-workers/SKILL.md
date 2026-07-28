@@ -71,7 +71,7 @@ Use both adapters only when tasks are independent or in a deliberate writer-revi
 
 ## Task and result contract
 
-Every delegated prompt must state the role, concrete deliverable, exact CWD, allowed scope, forbidden overlap, and requested verification. Require workspace proof before inspection or editing.
+Every delegated prompt must state the role, concrete deliverable, exact CWD, allowed scope, forbidden overlap, and requested verification. Require workspace proof before inspection or editing. Root Grok workers receive the six-field completion contract automatically; use `--no-capsule-contract` only when a machine-readable task intentionally needs a different output shape.
 
 Use this compact contract:
 
@@ -95,6 +95,7 @@ RISKS: <none or concise unresolved risks>
 The worker may reason and use tools freely, but its final response stays in the capsule. For an intentional non-Git task, use `root=non-git; base=none; head=none`. On collection:
 
 - Reject a mismatched workspace or a vague claim such as "tests passed" without the command. Require an exit code when a command was requested; accept `not run` only with a concrete reason.
+- Markdown-bold field labels such as `**STATUS:**` are accepted and normalized.
 - If a successful worker omitted the capsule, use one focused `followup` to request it; do not resume repeatedly just to reformat output.
 - Use `collect --capsule` for a normal successful handoff. Use ordinary `collect` only to diagnose failure; Grok results are allowlisted and never emit the provider's `thought` field.
 - Treat the capsule as a handoff, not proof of correctness. Independently inspect edits and rerun the smallest relevant verification.

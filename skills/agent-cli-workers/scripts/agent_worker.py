@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - Unix lifecycle is the supported path.
 
 
 SCHEMA_VERSION = 2
-RUNNER_VERSION = "0.3.0"
+RUNNER_VERSION = "0.4.0"
 HISTORY_SCHEMA_VERSION = 1
 DEFAULT_SANDBOX = "read-only"
 DEADLINE_TERMINATION_GRACE_SECONDS = 3.0
@@ -108,14 +108,15 @@ GROK_RESULT_FIELDS = (
 )
 CAPSULE_FIELDS = ("STATUS", "WORKSPACE", "SUMMARY", "FILES", "VERIFY", "RISKS")
 COMPLETION_CAPSULE_RE = re.compile(
-    r"^STATUS:[ \t]*(succeeded|blocked|failed)[ \t]*\r?\n"
-    r"WORKSPACE:[ \t]*(.+?)[ \t]*\r?\n"
-    r"SUMMARY:[ \t]*(.+?)[ \t]*\r?\n"
-    r"FILES:[ \t]*(.+?)[ \t]*\r?\n"
-    r"VERIFY:[ \t]*(.+?)[ \t]*\r?\n"
-    r"RISKS:[ \t]*(.+?)[ \t]*(?=\r?$)",
+    r"^(?:STATUS:|\*\*STATUS:\*\*|\*\*STATUS\*\*:)[ \t]*(succeeded|blocked|failed)[ \t]*\r?\n"
+    r"(?:WORKSPACE:|\*\*WORKSPACE:\*\*|\*\*WORKSPACE\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
+    r"(?:SUMMARY:|\*\*SUMMARY:\*\*|\*\*SUMMARY\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
+    r"(?:FILES:|\*\*FILES:\*\*|\*\*FILES\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
+    r"(?:VERIFY:|\*\*VERIFY:\*\*|\*\*VERIFY\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
+    r"(?:RISKS:|\*\*RISKS:\*\*|\*\*RISKS\*\*:)[ \t]*(.+?)[ \t]*(?=\r?$)",
     re.MULTILINE,
 )
+CAPSULE_CONTRACT_MARKER = "--- agent-cli-workers completion contract ---"
 
 
 class RunnerError(Exception):
@@ -232,7 +233,10 @@ def worker_dir(worker_id: str, *, require_exists: bool = True) -> Path:
 @contextmanager
 def worker_lock(directory: Path):
     lock_path = directory / ".lock"
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except FileNotFoundError as exc:
+        raise RunnerError("worker_not_found", f"state directory {directory.name!r} was not found") from exc
     try:
         if fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX)
@@ -335,6 +339,24 @@ def read_prompt(args: argparse.Namespace) -> str:
     if not prompt.strip():
         raise RunnerError("prompt_empty", "prompt must not be empty")
     return prompt
+
+
+def inject_completion_contract(prompt: str, cwd: str) -> str:
+    contract = f"""{CAPSULE_CONTRACT_MARKER}
+Before inspecting the task, run `pwd` and `git rev-parse --show-toplevel` and record the launch
+HEAD. If this is intentionally non-Git work, use root=non-git; base=none; head=none.
+
+Return only this final completion capsule:
+STATUS: succeeded|blocked|failed
+WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
+SUMMARY: <one or two concise sentences; reviews should include high-signal file:line findings>
+FILES: <comma-separated paths or none>
+VERIFY: <command => exit code; or not run with reason>
+RISKS: <none or concise unresolved risks>
+
+The requested working directory is {cwd}.
+"""
+    return f"{prompt.rstrip()}\n\n{contract}"
 
 
 def resolve_binary(agent: str, value: str | None) -> str:
@@ -1373,6 +1395,11 @@ def read_limited(path: Path, max_bytes: int) -> tuple[str, bool]:
 def cmd_spawn(args: argparse.Namespace) -> int:
     ensure_supported_options(args.agent, args)
     prompt = read_prompt(args)
+    if args.agent == "grok" and not args.no_capsule_contract:
+        prompt = inject_completion_contract(
+            prompt,
+            str(Path(args.cwd).expanduser().resolve()),
+        )
     metadata = create_worker(
         agent=args.agent,
         prompt=prompt,
@@ -1922,22 +1949,36 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     root = state_root()
     if directory.parent != root or directory == root:
         raise RunnerError("unsafe_cleanup_path", "refusing unsafe cleanup path", 5)
-    if args.discard_history:
-        shutil.rmtree(directory)
-        discard_history(args.worker_id)
-    elif telemetry_enabled():
-        history = history_root()
-        with worker_lock(history):
-            summary = snapshot_history_locked(metadata)
-            if summary is None:
-                raise RunnerError(
-                    "history_snapshot_unavailable",
-                    "cannot preserve telemetry summary from terminal worker metadata",
-                    5,
-                )
+
+    def remove_directory() -> None:
+        try:
             shutil.rmtree(directory)
-    else:
-        shutil.rmtree(directory)
+        except OSError as exc:
+            raise RunnerError("cleanup_failed", f"cannot remove worker state: {exc}", 5) from exc
+
+    with worker_lock(directory):
+        metadata = load_metadata(args.worker_id)
+        if metadata.get("state") in ACTIVE_STATES:
+            payload = public_metadata(metadata)
+            payload["error"] = "worker_not_terminal"
+            emit(payload)
+            return 4
+        if args.discard_history:
+            remove_directory()
+            discard_history(args.worker_id)
+        elif telemetry_enabled():
+            history = history_root()
+            with worker_lock(history):
+                summary = snapshot_history_locked(metadata)
+                if summary is None:
+                    raise RunnerError(
+                        "history_snapshot_unavailable",
+                        "cannot preserve telemetry summary from terminal worker metadata",
+                        5,
+                    )
+                remove_directory()
+        else:
+            remove_directory()
     emit({"worker_id": args.worker_id, "state": "cleaned"})
     return 0
 
@@ -1980,6 +2021,11 @@ def parser() -> argparse.ArgumentParser:
     spawn = commands.add_parser("spawn", help="Start a detached CLI worker")
     spawn.add_argument("--agent", required=True, choices=AGENTS)
     spawn.add_argument("--cwd", required=True, help="Exact working directory for the agent")
+    spawn.add_argument(
+        "--no-capsule-contract",
+        action="store_true",
+        help="Do not append the default completion capsule contract to a root Grok prompt",
+    )
     add_prompt_source(spawn)
     add_launch_options(spawn)
     spawn.set_defaults(func=cmd_spawn)

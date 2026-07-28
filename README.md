@@ -25,7 +25,7 @@ The runner provides:
 - private prompt files, process-group cancellation/deadlines, and owned state directories;
 - privacy-minimized derived run summaries, controller-recorded outcomes, local aggregate reports, and retention controls;
 - allowlisted Grok results that never emit the provider `thought` field;
-- `collect --capsule`, which normalizes the final six-line handoff and rejects invalid or oversized successful results;
+- a default root-Grok contract plus `collect --capsule`, which normalizes plain or Markdown-bold six-line handoffs and rejects invalid or oversized successful results;
 - workflow guidance for one writer per overlapping file set and caller-owned worktrees.
 
 ## Non-goals
@@ -100,6 +100,8 @@ python3 "$RUNNER" collect <worker-id> --capsule --wait 30
 Use ordinary `collect` only to diagnose a terminal failure. Even diagnostic collection filters Grok's top-level result fields and never falls back to malformed or truncated Grok stdout.
 
 For an editing worker, choose `--agent codex --sandbox workspace-write`. Create and clean any isolation worktree yourself; the runner never changes Git topology.
+
+Root Grok prompts receive the completion contract automatically; pass `--no-capsule-contract` only for intentional non-capsule output.
 
 ## Turn caps and long tasks
 

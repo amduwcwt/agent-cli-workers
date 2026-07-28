@@ -29,7 +29,7 @@ Only one active descendant may resume a native session at a time.
 
 1. Prompt text is untrusted and may contain secrets. Prefer `--prompt-file` or stdin; prompt files are private and deleted after execution.
 2. Provider output is untrusted. Grok JSON is parsed through a top-level allowlist. The provider `thought` field and malformed/truncated raw stdout are never emitted by the runner.
-3. A completion capsule is a context boundary, not proof. `collect --capsule` extracts the last ordered six-field block, normalizes it, limits it to 16 KiB, and rejects a successful worker without a valid block.
+3. A completion capsule is a context boundary, not proof. Root Grok prompts receive the contract by default. `collect --capsule` extracts the last ordered six-field block, accepts plain or Markdown-bold labels, normalizes it, limits it to 16 KiB, and rejects a successful worker without a valid block.
 4. Worker claims are untrusted. The caller compares workspace proof, inspects diffs, and reruns focused verification.
 5. State paths are privileged local persistence. The state root must be owned, non-symlinked, and inaccessible to group/other users.
 6. Telemetry is derived persistence, not a transcript archive. The sibling history root receives one atomic `0600` JSON summary per worker under an owned, non-symlinked `0700` directory. It excludes prompt/result text, thought, raw stderr, cwd, filenames, session ids, diffs, and arbitrary provider keys.

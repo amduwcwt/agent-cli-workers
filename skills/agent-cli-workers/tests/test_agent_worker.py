@@ -235,7 +235,7 @@ class AgentWorkerTests(unittest.TestCase):
     def test_grok_adapter_spawn_collect_and_list(self):
         prompt = self.write_prompt("grok.md", "SLEEP=2\ngrok task")
         started = time.monotonic()
-        proc, spawned = self.spawn("grok", prompt)
+        proc, spawned = self.spawn("grok", prompt, "--no-capsule-contract")
         elapsed = time.monotonic() - started
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertLess(elapsed, 1.5)
@@ -339,6 +339,51 @@ class AgentWorkerTests(unittest.TestCase):
         )
 
         self.assertIsNone(RUNNER_API["extract_completion_capsule"](oversized))
+
+    def test_completion_capsule_accepts_markdown_bold_labels(self):
+        bolded = "\n".join(
+            (
+                "**STATUS:** succeeded",
+                "**WORKSPACE**: pwd=/tmp; root=non-git; base=none; head=none",
+                "**SUMMARY:** Bolded labels are still a valid handoff.",
+                "FILES: none",
+                "**VERIFY:** not run because this was a read-only review",
+                "**RISKS**: none",
+            )
+        )
+
+        capsule = RUNNER_API["extract_completion_capsule"](bolded)
+        self.assertIsNotNone(capsule)
+        self.assertTrue(capsule.startswith("STATUS: succeeded"))
+        self.assertIn("SUMMARY: Bolded labels are still a valid handoff.", capsule)
+
+    def test_grok_root_prompt_receives_completion_contract(self):
+        prompt = self.write_prompt("grok-contract.md", "review the parser")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        sent = self.invocations()[-1]["prompt"]
+        self.assertIn(RUNNER_API["CAPSULE_CONTRACT_MARKER"], sent)
+        self.assertIn("review the parser", sent)
+        self.assertIn(str(self.work_dir), sent)
+
+    def test_capsule_contract_can_be_suppressed(self):
+        prompt = self.write_prompt("grok-no-contract.md", "review the parser")
+        proc, spawned = self.spawn("grok", prompt, "--no-capsule-contract")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        sent = self.invocations()[-1]["prompt"]
+        self.assertNotIn(RUNNER_API["CAPSULE_CONTRACT_MARKER"], sent)
+        self.assertEqual(sent, "review the parser")
+
+    def test_worker_lock_reports_missing_state_directory(self):
+        missing = self.state_dir / "grok-00000000000000-000000"
+        with self.assertRaises(RUNNER_API["RunnerError"]) as raised:
+            with RUNNER_API["worker_lock"](missing):
+                pass
+        self.assertEqual(raised.exception.error, "worker_not_found")
 
     def test_grok_sandbox_is_passed_through(self):
         prompt = self.write_prompt("grok-sandbox.md", "sandbox task")
@@ -461,6 +506,53 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertEqual(cleanup_proc.returncode, 5)
         self.assertEqual(cleanup["error"], "unsafe_worker_path")
         self.assertTrue(victim.is_dir())
+
+    def test_cleanup_rechecks_terminal_state_while_holding_worker_lock(self):
+        directory, active = self.seed_worker("cleanup-race", state="running")
+        stale_terminal = dict(active, state="succeeded")
+        emitted = mock.Mock()
+        cleanup = RUNNER_API["cmd_cleanup"]
+
+        with (
+            mock.patch.dict(os.environ, self.env),
+            mock.patch.dict(
+                cleanup.__globals__,
+                {
+                    "refreshed_metadata": mock.Mock(return_value=stale_terminal),
+                    "emit": emitted,
+                },
+            ),
+        ):
+            result = cleanup(
+                argparse.Namespace(worker_id="cleanup-race", discard_history=False)
+            )
+
+        self.assertEqual(result, 4)
+        self.assertTrue(directory.is_dir())
+        self.assertEqual(emitted.call_args.args[0]["error"], "worker_not_terminal")
+
+    def test_cleanup_normalizes_directory_removal_failure(self):
+        directory, _ = self.seed_worker("cleanup-rmtree-failure")
+        cleanup = RUNNER_API["cmd_cleanup"]
+
+        with (
+            mock.patch.dict(os.environ, self.env),
+            mock.patch.object(
+                cleanup.__globals__["shutil"],
+                "rmtree",
+                side_effect=OSError("read-only filesystem"),
+            ),
+        ):
+            with self.assertRaises(RUNNER_API["RunnerError"]) as raised:
+                cleanup(
+                    argparse.Namespace(
+                        worker_id="cleanup-rmtree-failure",
+                        discard_history=False,
+                    )
+                )
+
+        self.assertEqual(raised.exception.error, "cleanup_failed")
+        self.assertTrue(directory.is_dir())
 
     def test_inline_prompt_has_same_size_limit_as_other_sources(self):
         args = argparse.Namespace(
