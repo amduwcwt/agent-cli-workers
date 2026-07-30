@@ -71,9 +71,14 @@ Use both adapters only when tasks are independent or in a deliberate writer-revi
 
 ## Task and result contract
 
-Every delegated prompt must state the role, concrete deliverable, exact CWD, allowed scope, forbidden overlap, and requested verification. Require workspace proof before inspection or editing. Root Grok workers receive the six-field completion contract automatically; use `--no-capsule-contract` only when a machine-readable task intentionally needs a different output shape.
+Every delegated prompt must state the role, concrete deliverable, exact CWD, allowed scope, forbidden overlap, and requested verification. Require workspace proof before inspection or editing.
 
-Use this compact contract:
+Choose one result boundary before launch:
+
+- Use the compact boundary for one bounded verdict, a short check, or an implementation handoff whose useful result fits the automatic six single-line fields. Root Grok workers receive this contract automatically. Do not copy the six-field capsule into a root Grok prompt; the runner also detects an existing ordered six-field contract and avoids appending a duplicate.
+- Use a detailed review boundary when the deliverable requires multiple findings, a table or mapping, facts versus inferences, several file:line citations, alternatives, or a falsification experiment. Pass `--no-capsule-contract`, define the detailed output shape in the task prompt, and use ordinary `collect`. Ordinary collection remains allowlisted and excludes Grok `thought`; telemetry records the capsule as `not-requested` instead of invalid in this explicitly selected mode.
+
+Use this prompt shape for a compact root Grok task:
 
 ```text
 Role: <investigator|reviewer|implementer>
@@ -82,22 +87,14 @@ CWD: <exact absolute repository or worktree path>
 Scope: <owned files/modules; forbidden edits or read-only>
 Workspace proof: first run pwd and git rev-parse --show-toplevel; record launch HEAD as base and final HEAD as head
 Verification: <specific commands, or explain why none are appropriate>
-
-Return only this final completion capsule:
-STATUS: succeeded|blocked|failed
-WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
-SUMMARY: <one or two concise sentences; include highest-signal file:line findings for reviews>
-FILES: <comma-separated paths or none>
-VERIFY: <command => exit code; or not run with reason>
-RISKS: <none or concise unresolved risks>
 ```
 
-The worker may reason and use tools freely, but its final response stays in the capsule. For an intentional non-Git task, use `root=non-git; base=none; head=none`. On collection:
+The runner appends the compact six-field contract. The worker may reason and use tools freely, but its final response keeps every capsule field on one physical line. For an intentional non-Git task, use `root=non-git; base=none; head=none`. On collection:
 
 - Reject a mismatched workspace or a vague claim such as "tests passed" without the command. Require an exit code when a command was requested; accept `not run` only with a concrete reason.
-- Markdown-bold field labels such as `**STATUS:**` are accepted and normalized.
+- Markdown-bold field labels and whole-line bold fields are accepted and normalized. The parser also tolerates Grok progress text concatenated immediately before the final `STATUS` field.
 - If a successful worker omitted the capsule, use one focused `followup` to request it; do not resume repeatedly just to reformat output.
-- Use `collect --capsule` for a normal successful handoff. Use ordinary `collect` only to diagnose failure; Grok results are allowlisted and never emit the provider's `thought` field.
+- Use `collect --capsule` for a compact handoff. Use ordinary `collect` for an intentional detailed review or to diagnose failure; Grok results are allowlisted and never emit the provider's `thought` field.
 - Treat the capsule as a handoff, not proof of correctness. Independently inspect edits and rerun the smallest relevant verification.
 
 ## Quick start
@@ -180,7 +177,7 @@ python3 "$RUNNER" list  # global diagnostic across repositories
 python3 "$RUNNER" status <worker-id>
 python3 "$RUNNER" collect <worker-id> --capsule
 python3 "$RUNNER" collect <worker-id> --capsule --wait 30
-# Failure diagnosis only:
+# Intentional detailed Grok review or failure diagnosis:
 python3 "$RUNNER" collect <worker-id>
 python3 "$RUNNER" followup <worker-id> --prompt-file <followup-prompt>
 python3 "$RUNNER" cancel <worker-id>
@@ -229,7 +226,7 @@ python3 "$RUNNER" report --since-days 30
 python3 "$RUNNER" purge-history --older-than-days 90
 ```
 
-Use only the versioned CLI enums for task class, route reason, outcome, verification, and optional `--reason-code`; do not encode free-form prompt or transcript text into labels. `report` exposes fixed low-cardinality aggregates with explicit run and missing-feedback denominators. Treat small samples as observations, not routing proof.
+Use only the versioned CLI enums for task class, route reason, outcome, verification, and optional `--reason-code`; do not encode free-form prompt or transcript text into labels. Use `deliverable-incomplete` when the requested output shape is missing, `evidence-missing` when a claim lacks requested evidence, and `claim-conflict` only when independent evidence contradicts a provider claim. Keep provider/transport, capsule, workspace, scope, evidence, and claim failures distinct. Describe the run as rejected for its recorded reason; do not generalize one rejected handoff into a provider-level trust judgment. `report` exposes fixed low-cardinality aggregates with explicit run and missing-feedback denominators. Treat small samples as observations, not routing proof.
 
 Telemetry is local and enabled by default. Set `AGENT_CLI_WORKERS_TELEMETRY=0` to disable new summaries. Override the private history location with `AGENT_CLI_WORKERS_HISTORY_DIR`; otherwise it is a sibling of the worker state directory. The runner validates owned/non-symlinked `0700` history storage and writes atomic `0600` summaries.
 
@@ -267,7 +264,7 @@ Call `begin` before direct work or worker launch. Use `--predicted-route direct 
 4. If a fresh Grok session sees the wrong filesystem twice under the correct local CWD, stop retrying and report a worker/provider workspace-view failure.
 5. If Grok reaches a turn cap without a completion capsule, diagnose once and do not resume that session just to ask it to finish. Narrow the work and start fresh only when another attempt is justified.
 6. Use one primary worker by default. For writer-reviewer work, wait for the Codex writer to finish, then give Grok a read-only review at the fixed worktree or commit.
-7. Collect with `--capsule`, review diffs, and independently rerun focused verification before integration.
+7. Collect compact work with `--capsule`; collect an explicitly detailed review normally. Review diffs and independently rerun focused verification before integration.
 8. `cleanup` workers and remove temporary worktrees if created.
 
 ## Notes

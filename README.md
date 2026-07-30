@@ -57,7 +57,7 @@ The second skill is an optional Grok-focused compatibility entry point. The shar
 
 ## Quick start
 
-Write a bounded task contract to a file:
+Write a bounded compact task to a file. Do not include the six-field capsule; the runner appends it to root Grok prompts:
 
 ```text
 Role: reviewer
@@ -66,14 +66,6 @@ CWD: /absolute/path/to/repository
 Scope: read-only; do not edit files
 Workspace proof: report pwd, repository root, launch HEAD, and final HEAD
 Verification: explain why no command is appropriate for a read-only review
-
-Return only this final completion capsule:
-STATUS: succeeded|blocked|failed
-WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
-SUMMARY: <one or two concise sentences>
-FILES: <comma-separated paths or none>
-VERIFY: <command => exit code; or not run with reason>
-RISKS: <none or concise unresolved risks>
 ```
 
 Start one worker:
@@ -97,11 +89,26 @@ python3 "$RUNNER" status <worker-id>
 python3 "$RUNNER" collect <worker-id> --capsule --wait 30
 ```
 
-Use ordinary `collect` only to diagnose a terminal failure. Even diagnostic collection filters Grok's top-level result fields and never falls back to malformed or truncated Grok stdout.
+Detailed Grok reviews that require multiple findings, tables, extensive citations, fact/inference separation, or falsification experiments should opt out of compression:
+
+```bash
+python3 "$RUNNER" spawn \
+  --agent grok \
+  --cwd /absolute/path/to/repository \
+  --task-class review \
+  --route-reason independent-review \
+  --sandbox read-only \
+  --no-capsule-contract \
+  --prompt-file /absolute/path/to/detailed-review.md
+
+python3 "$RUNNER" collect <worker-id>
+```
+
+Define the detailed output shape and workspace proof in that prompt. Ordinary collection is intentional for this mode and for terminal failure diagnosis. It filters Grok's top-level result fields, never falls back to malformed or truncated Grok stdout, and records an opted-out capsule as `not-requested` instead of invalid.
 
 For an editing worker, choose `--agent codex --sandbox workspace-write`. Create and clean any isolation worktree yourself; the runner never changes Git topology.
 
-Root Grok prompts receive the completion contract automatically; pass `--no-capsule-contract` only for intentional non-capsule output.
+Root compact Grok prompts receive the completion contract automatically and existing ordered contracts are not duplicated. Pass `--no-capsule-contract` for intentional detailed or other non-capsule output.
 
 ## Turn caps and long tasks
 

@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - Unix lifecycle is the supported path.
 
 
 SCHEMA_VERSION = 2
-RUNNER_VERSION = "0.4.0"
+RUNNER_VERSION = "0.5.0"
 HISTORY_SCHEMA_VERSION = 1
 DEFAULT_SANDBOX = "read-only"
 DEADLINE_TERMINATION_GRACE_SECONDS = 3.0
@@ -81,6 +81,9 @@ OUTCOME_REASON_CODES = (
     "too-slow",
     "redundant-authorization-prompt",
     "scope-mismatch",
+    "deliverable-incomplete",
+    "evidence-missing",
+    "claim-conflict",
     "other",
 )
 FAILURE_CLASSES = (
@@ -107,16 +110,37 @@ GROK_RESULT_FIELDS = (
     "modelUsage",
 )
 CAPSULE_FIELDS = ("STATUS", "WORKSPACE", "SUMMARY", "FILES", "VERIFY", "RISKS")
+
+
+def capsule_label_pattern(field: str) -> str:
+    return rf"(?:\*\*{field}:\*\*|\*\*{field}\*\*:|\*\*{field}:|{field}:)"
+
+
+def capsule_value_pattern(field: str, value: str = r".+?") -> str:
+    return rf"{capsule_label_pattern(field)}[ \t]*({value})[ \t]*(?:\*\*)?[ \t]*"
+
+
+CAPSULE_LINE_BREAK = r"\r?\n(?:[ \t]*\r?\n)*"
 COMPLETION_CAPSULE_RE = re.compile(
-    r"^(?:STATUS:|\*\*STATUS:\*\*|\*\*STATUS\*\*:)[ \t]*(succeeded|blocked|failed)[ \t]*\r?\n"
-    r"(?:WORKSPACE:|\*\*WORKSPACE:\*\*|\*\*WORKSPACE\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
-    r"(?:SUMMARY:|\*\*SUMMARY:\*\*|\*\*SUMMARY\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
-    r"(?:FILES:|\*\*FILES:\*\*|\*\*FILES\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
-    r"(?:VERIFY:|\*\*VERIFY:\*\*|\*\*VERIFY\*\*:)[ \t]*(.+?)[ \t]*\r?\n"
-    r"(?:RISKS:|\*\*RISKS:\*\*|\*\*RISKS\*\*:)[ \t]*(.+?)[ \t]*(?=\r?$)",
-    re.MULTILINE,
+    r"(?<![A-Za-z0-9_])"
+    + capsule_value_pattern("STATUS", r"succeeded|blocked|failed")
+    + CAPSULE_LINE_BREAK
+    + capsule_value_pattern("WORKSPACE")
+    + CAPSULE_LINE_BREAK
+    + capsule_value_pattern("SUMMARY")
+    + CAPSULE_LINE_BREAK
+    + capsule_value_pattern("FILES")
+    + CAPSULE_LINE_BREAK
+    + capsule_value_pattern("VERIFY")
+    + CAPSULE_LINE_BREAK
+    + capsule_value_pattern("RISKS")
+    + r"(?:\r?\n[ \t]*)*\Z"
 )
 CAPSULE_CONTRACT_MARKER = "--- agent-cli-workers completion contract ---"
+CAPSULE_PROMPT_FIELD_RES = tuple(
+    re.compile(rf"^[ \t]*{capsule_label_pattern(field)}", re.MULTILINE)
+    for field in CAPSULE_FIELDS
+)
 
 
 class RunnerError(Exception):
@@ -341,7 +365,21 @@ def read_prompt(args: argparse.Namespace) -> str:
     return prompt
 
 
+def prompt_has_completion_contract(prompt: str) -> bool:
+    if CAPSULE_CONTRACT_MARKER in prompt:
+        return True
+    cursor = 0
+    for pattern in CAPSULE_PROMPT_FIELD_RES:
+        match = pattern.search(prompt, cursor)
+        if match is None:
+            return False
+        cursor = match.end()
+    return True
+
+
 def inject_completion_contract(prompt: str, cwd: str) -> str:
+    if prompt_has_completion_contract(prompt):
+        return prompt
     contract = f"""{CAPSULE_CONTRACT_MARKER}
 Before inspecting the task, run `pwd` and `git rev-parse --show-toplevel` and record the launch
 HEAD. If this is intentionally non-Git work, use root=non-git; base=none; head=none.
@@ -349,10 +387,13 @@ HEAD. If this is intentionally non-Git work, use root=non-git; base=none; head=n
 Return only this final completion capsule:
 STATUS: succeeded|blocked|failed
 WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
-SUMMARY: <one or two concise sentences; reviews should include high-signal file:line findings>
+SUMMARY: <one concise sentence; reviews should include high-signal file:line findings>
 FILES: <comma-separated paths or none>
 VERIFY: <command => exit code; or not run with reason>
 RISKS: <none or concise unresolved risks>
+
+Keep every field on one physical line. Do not add progress prose to the final result and do not
+repeat this contract.
 
 The requested working directory is {cwd}.
 """
@@ -440,6 +481,7 @@ def public_metadata(metadata: dict) -> dict:
         "parent_worker_id",
         "task_class",
         "route_reason",
+        "capsule_contract_requested",
         "deadline_seconds",
         "deadline_at",
         "timed_out_at",
@@ -484,6 +526,7 @@ def create_worker(
     route_reason: str,
     sandbox: str | None,
     dangerously_bypass_approvals_and_sandbox: bool,
+    capsule_contract_requested: bool | None = None,
     resume_session_id: str | None = None,
     parent_worker_id: str | None = None,
 ) -> dict:
@@ -532,6 +575,7 @@ def create_worker(
         "deadline_seconds": deadline_seconds,
         "task_class": task_class,
         "route_reason": route_reason,
+        "capsule_contract_requested": capsule_contract_requested,
         "model": effective_model,
         "sandbox": effective_sandbox,
         "dangerously_bypass_approvals_and_sandbox": dangerously_bypass_approvals_and_sandbox,
@@ -871,7 +915,11 @@ def build_history_summary(metadata: dict, existing: dict | None = None) -> dict:
             "wrapper_log_bytes": file_size(metadata.get("wrapper_log_path")),
             "final_output_bytes": file_size(metadata.get("final_output_path")),
         },
-        "capsule": capsule_metrics(result),
+        "capsule": (
+            {"status": "not-requested", "bytes": 0}
+            if metadata.get("capsule_contract_requested") is False
+            else capsule_metrics(result)
+        ),
         "result_truncated": bool(metadata.get("result_truncated") or result_truncated),
         "controller": existing_controller,
     }
@@ -959,7 +1007,7 @@ def canonical_history_summary(summary: dict) -> dict:
     artifacts = summary.get("artifacts") if isinstance(summary.get("artifacts"), dict) else {}
     capsule = summary.get("capsule") if isinstance(summary.get("capsule"), dict) else {}
     capsule_status = capsule.get("status")
-    if capsule_status not in {"valid", "invalid", "missing"}:
+    if capsule_status not in {"valid", "invalid", "missing", "not-requested"}:
         capsule_status = "missing"
     parent_worker_id = summary.get("parent_worker_id")
     if not isinstance(parent_worker_id, str) or not WORKER_ID_RE.fullmatch(parent_worker_id):
@@ -1413,6 +1461,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         route_reason=args.route_reason,
         sandbox=args.sandbox,
         dangerously_bypass_approvals_and_sandbox=args.dangerously_bypass_approvals_and_sandbox,
+        capsule_contract_requested=(
+            not args.no_capsule_contract if args.agent == "grok" else None
+        ),
     )
     emit(public_metadata(metadata))
     return 0
@@ -1577,6 +1628,7 @@ def cmd_followup(args: argparse.Namespace) -> int:
             route_reason=args.route_reason,
             sandbox=followup_sandbox,
             dangerously_bypass_approvals_and_sandbox=dangerous_bypass,
+            capsule_contract_requested=parent.get("capsule_contract_requested"),
             resume_session_id=session_id,
             parent_worker_id=parent["worker_id"],
         )
@@ -1818,6 +1870,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             "valid": 0,
             "invalid": 0,
             "missing": 0,
+            "not-requested": 0,
         },
         "artifact_bytes": {
             "stdout_bytes": 0,
@@ -1876,7 +1929,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             report["usage"]["missing"] += 1
         capsule = summary.get("capsule") if isinstance(summary.get("capsule"), dict) else {}
         capsule_status = capsule.get("status")
-        if capsule_status not in {"valid", "invalid", "missing"}:
+        if capsule_status not in {"valid", "invalid", "missing", "not-requested"}:
             capsule_status = "missing"
         report["capsules"][capsule_status] += 1
         capsule_bytes = capsule.get("bytes")

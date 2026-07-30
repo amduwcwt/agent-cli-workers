@@ -36,18 +36,22 @@ Use Grok as the primary worker for fast read-only investigation, bounded review,
 - Delegation changes who performs an action, not the action's authorization class. Route an implementation envelope to the normal Codex writer unless the task constrains provider choice; never convert a read-only envelope into write authority merely because an agent is requested.
 - Compare each next action with the current envelope. Ask only when it adds a new target, operation class, external side-effect domain, dangerous bypass, destructive or irreversible behavior, or credential access. Reuse authority already present in the envelope until the action completes, the user revokes it, or the task is superseded.
 
-Require Grok to end with the same compact handoff used by the shared runner. Root async Grok prompts receive this contract automatically; use `--no-capsule-contract` only for an intentional alternative output shape:
+Choose the output boundary before launch. Use the shared runner's compact handoff for one bounded verdict or short check. Root async Grok prompts receive this contract automatically. Do not copy the six-field capsule into a root Grok prompt; the runner defensively avoids duplicating an existing ordered six-field contract.
+
+Use a detailed review boundary when the task requires multiple findings, a table or mapping, facts versus inferences, several citations, alternatives, or a falsification experiment. Pass `--no-capsule-contract`, define that output shape in the prompt, and use ordinary `collect`. Ordinary collection is intentional for this mode, remains allowlisted, never emits Grok `thought`, and records capsule telemetry as `not-requested` instead of invalid.
+
+The automatic compact contract is:
 
 ```text
 STATUS: succeeded|blocked|failed
 WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
-SUMMARY: <one or two concise sentences; include highest-signal file:line findings for reviews>
+SUMMARY: <one concise sentence; include highest-signal file:line findings for reviews>
 FILES: <comma-separated paths or none>
 VERIFY: <command => exit code; or not run with reason>
 RISKS: <none or concise unresolved risks>
 ```
 
-For code-aware work, record the launch revision as `base` and the final revision as `head`; this remains unambiguous if a writer commits. For intentional non-Git research, use `root=non-git; base=none; head=none`. Reject mismatched workspace proof. Read full Grok output only to diagnose a failure; otherwise keep the main context to the completion capsule and independently verify any edits or claims.
+For code-aware work, record the launch revision as `base` and the final revision as `head`; this remains unambiguous if a writer commits. For intentional non-Git research, use `root=non-git; base=none; head=none`. Reject mismatched workspace proof. Read full Grok output for an intentional detailed review or to diagnose a failure; otherwise keep the main context to the completion capsule and independently verify any edits or claims.
 
 ## Run an asynchronous Grok worker
 
@@ -83,11 +87,11 @@ python3 "$RUNNER" list --cwd "$PWD" --agent grok
 python3 "$RUNNER" status <worker-id>
 python3 "$RUNNER" collect <worker-id> --capsule
 python3 "$RUNNER" collect <worker-id> --capsule --wait 30
-# Failure diagnosis only:
+# Intentional detailed review or failure diagnosis:
 python3 "$RUNNER" collect <worker-id>
 ```
 
-Capsule collection exits `0` for success, `1` for a terminal failure/cancellation, `3` while active, and `4` when a successful worker omitted a valid capsule. Plain and Markdown-bold field labels are normalized. Avoid a blocking wait longer than 60 seconds. The compact result excludes Grok `thought` and token-usage payloads. Use ordinary `collect` only for failure diagnosis; it still allowlists Grok's result fields and never emits `thought`. Independently inspect delegated code changes and run focused verification.
+Capsule collection exits `0` for success, `1` for a terminal failure/cancellation, `3` while active, and `4` when a successful worker omitted a valid capsule. Plain, label-bold, and whole-line-bold fields are normalized; Grok progress text concatenated immediately before final `STATUS` is tolerated. Avoid a blocking wait longer than 60 seconds. The compact result excludes Grok `thought` and token-usage payloads. Ordinary `collect` is valid for an explicitly detailed review and for failure diagnosis; it still allowlists Grok's result fields and never emits `thought`. Independently inspect delegated code changes and run focused verification.
 
 ### Continue, cancel, and clean
 
@@ -125,6 +129,8 @@ python3 "$LEGACY_RUNNER" record-outcome <worker-id> \
   --verification passed
 python3 "$LEGACY_RUNNER" report --since-days 30
 ```
+
+Use `deliverable-incomplete` when Grok omitted part of the requested output, `evidence-missing` when requested support is absent, and `claim-conflict` only after independent evidence contradicts a claim. Keep these separate from provider, capsule, workspace, and scope failures. Report why one handoff was rejected instead of describing Grok as globally untrusted.
 
 The shared runner stores only derived, low-cardinality summaries in private local history. It never places prompt text, result text, provider thought, raw stderr, cwd, filenames, session ids, or arbitrary usage keys in telemetry. Record outcomes only after independent verification; use `purge-history` for retention and `cleanup --discard-history` only as the explicit raw-deletion escape hatch when history is unavailable or corrupt.
 

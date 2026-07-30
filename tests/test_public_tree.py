@@ -121,6 +121,24 @@ class PublicTreeTests(unittest.TestCase):
         self.assertNotIn("agent_worker", observer)
         self.assertNotIn("subprocess", observer)
 
+    def test_grok_result_contract_separates_compact_and_detailed_reviews(self):
+        shared = (ROOT / "skills" / "agent-cli-workers" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        grok = (ROOT / "skills" / "grok-build-cli" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        for text in (shared, grok):
+            self.assertIn("Do not copy the six-field capsule into a root Grok prompt", text)
+            self.assertIn("detailed review", text.casefold())
+            self.assertIn("`--no-capsule-contract`", text)
+            self.assertIn("`claim-conflict`", text)
+            self.assertIn("`not-requested`", text)
+        self.assertIn("Detailed Grok reviews", readme)
+        self.assertIn("--no-capsule-contract", readme)
+
 
 if __name__ == "__main__":
     unittest.main()

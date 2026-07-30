@@ -357,6 +357,32 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertTrue(capsule.startswith("STATUS: succeeded"))
         self.assertIn("SUMMARY: Bolded labels are still a valid handoff.", capsule)
 
+    def test_completion_capsule_accepts_grok_progress_prefix_and_whole_line_bold(self):
+        grok_text = (
+            "I'll finish the focused review now.STATUS: succeeded\n\n"
+            "**WORKSPACE: pwd=/tmp; root=non-git; base=none; head=none**  \n\n"
+            "**SUMMARY: The requested evidence was checked.**  \n\n"
+            "**FILES: none**  \n\n"
+            "**VERIFY: not run because this was a read-only review**  \n\n"
+            "**RISKS: none**\n"
+        )
+
+        capsule = RUNNER_API["extract_completion_capsule"](grok_text)
+
+        self.assertEqual(
+            capsule,
+            "\n".join(
+                (
+                    "STATUS: succeeded",
+                    "WORKSPACE: pwd=/tmp; root=non-git; base=none; head=none",
+                    "SUMMARY: The requested evidence was checked.",
+                    "FILES: none",
+                    "VERIFY: not run because this was a read-only review",
+                    "RISKS: none",
+                )
+            ),
+        )
+
     def test_grok_root_prompt_receives_completion_contract(self):
         prompt = self.write_prompt("grok-contract.md", "review the parser")
         proc, spawned = self.spawn("grok", prompt)
@@ -368,6 +394,28 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertIn("review the parser", sent)
         self.assertIn(str(self.work_dir), sent)
 
+    def test_grok_root_prompt_does_not_duplicate_an_existing_completion_contract(self):
+        task = """Role: reviewer
+Task: review the parser
+
+Return only this final completion capsule:
+STATUS: succeeded|blocked|failed
+WORKSPACE: pwd=<path>; root=<path>; base=<launch-sha>; head=<final-sha>
+SUMMARY: <one concise sentence>
+FILES: <comma-separated paths or none>
+VERIFY: <command and exit code>
+RISKS: <remaining risks or none>
+"""
+        prompt = self.write_prompt("grok-existing-contract.md", task)
+
+        proc, spawned = self.spawn("grok", prompt)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+        sent = self.invocations()[-1]["prompt"]
+        self.assertEqual(sent, task)
+        self.assertNotIn(RUNNER_API["CAPSULE_CONTRACT_MARKER"], sent)
+
     def test_capsule_contract_can_be_suppressed(self):
         prompt = self.write_prompt("grok-no-contract.md", "review the parser")
         proc, spawned = self.spawn("grok", prompt, "--no-capsule-contract")
@@ -377,6 +425,20 @@ class AgentWorkerTests(unittest.TestCase):
         sent = self.invocations()[-1]["prompt"]
         self.assertNotIn(RUNNER_API["CAPSULE_CONTRACT_MARKER"], sent)
         self.assertEqual(sent, "review the parser")
+        self.assertFalse(spawned["capsule_contract_requested"])
+
+    def test_telemetry_marks_explicit_non_capsule_result_not_requested(self):
+        prompt = self.write_prompt("grok-detailed-review.md", "detailed review body")
+        proc, spawned = self.spawn("grok", prompt, "--no-capsule-contract")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        summary = self.read_history(spawned["worker_id"])
+        self.assertEqual(summary["capsule"], {"status": "not-requested", "bytes": 0})
+        report_proc, report = self.run_cli("report", "--since-days", "30")
+        self.assertEqual(report_proc.returncode, 0, report_proc.stderr)
+        self.assertEqual(report["capsules"]["not-requested"], 1)
+        self.assertEqual(report["capsules"]["invalid"], 0)
 
     def test_worker_lock_reports_missing_state_directory(self):
         missing = self.state_dir / "grok-00000000000000-000000"
@@ -1099,6 +1161,43 @@ class AgentWorkerTests(unittest.TestCase):
         summary = self.read_history(spawned["worker_id"])
         self.assertEqual(summary["task_class"], "review")
         self.assertEqual(summary["route_reason"], "independent-review")
+
+    def test_record_outcome_distinguishes_delivery_evidence_and_claim_failures(self):
+        prompt = self.write_prompt("reason-codes.md", "reason codes")
+        proc, spawned = self.spawn("grok", prompt)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.wait_state(spawned["worker_id"], {"succeeded"})
+
+        outcome_proc, outcome = self.run_cli(
+            "record-outcome",
+            spawned["worker_id"],
+            "--outcome",
+            "rejected",
+            "--verification",
+            "failed",
+            "--reason-code",
+            "deliverable-incomplete",
+            "--reason-code",
+            "evidence-missing",
+            "--reason-code",
+            "claim-conflict",
+        )
+
+        self.assertEqual(outcome_proc.returncode, 0, outcome_proc.stderr)
+        self.assertEqual(
+            outcome["controller"]["reason_codes"],
+            ["deliverable-incomplete", "evidence-missing", "claim-conflict"],
+        )
+        report_proc, report = self.run_cli("report", "--since-days", "30")
+        self.assertEqual(report_proc.returncode, 0, report_proc.stderr)
+        self.assertEqual(
+            report["by_reason_code"],
+            {
+                "claim-conflict": 1,
+                "deliverable-incomplete": 1,
+                "evidence-missing": 1,
+            },
+        )
 
     def test_record_outcome_drops_unknown_history_fields_without_echoing_them(self):
         prompt = self.write_prompt("outcome-canary.md", "outcome canary")

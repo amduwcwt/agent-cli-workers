@@ -29,11 +29,11 @@ Only one active descendant may resume a native session at a time.
 
 1. Prompt text is untrusted and may contain secrets. Prefer `--prompt-file` or stdin; prompt files are private and deleted after execution.
 2. Provider output is untrusted. Grok JSON is parsed through a top-level allowlist. The provider `thought` field and malformed/truncated raw stdout are never emitted by the runner.
-3. A completion capsule is a context boundary, not proof. Root Grok prompts receive the contract by default. `collect --capsule` extracts the last ordered six-field block, accepts plain or Markdown-bold labels, normalizes it, limits it to 16 KiB, and rejects a successful worker without a valid block.
+3. A completion capsule is a compact context boundary, not proof. Root Grok prompts receive a deduplicated contract by default. `collect --capsule` extracts the final ordered six-field block, accepts plain, label-bold, and whole-line-bold fields plus a concatenated progress prefix, normalizes it, limits it to 16 KiB, and rejects a successful compact worker without a valid block. Detailed reviews opt out with `--no-capsule-contract`, use allowlisted ordinary collection so evidence is not forced into six lines, and record capsule telemetry as `not-requested`.
 4. Worker claims are untrusted. The caller compares workspace proof, inspects diffs, and reruns focused verification.
 5. State paths are privileged local persistence. The state root must be owned, non-symlinked, and inaccessible to group/other users.
 6. Telemetry is derived persistence, not a transcript archive. The sibling history root receives one atomic `0600` JSON summary per worker under an owned, non-symlinked `0700` directory. It excludes prompt/result text, thought, raw stderr, cwd, filenames, session ids, diffs, and arbitrary provider keys.
-7. Task class, route reason, outcome, verification, and reason codes are controller-submitted allowlisted labels with explicit provenance. They are not inferred from prompts and are not provider self-evaluation.
+7. Task class, route reason, outcome, verification, and reason codes are controller-submitted allowlisted labels with explicit provenance. They are not inferred from prompts and are not provider self-evaluation. Delivery, missing evidence, independently contradicted claims, capsule, workspace, scope, and transport failures remain separate dimensions rather than a provider-wide trust label.
 
 ## Controller observation boundary
 
